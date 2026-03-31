@@ -39,7 +39,7 @@ from ats_poc.sample_selection import (
 
 router = APIRouter(prefix="/api")
 
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.5-flash"
 PREVIEW_BATCH_SIZE = 6
 
 
