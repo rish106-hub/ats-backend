@@ -322,6 +322,30 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
     return row
 
 
+@router.post("/sessions/{session_id}/preview/reload", response_model=SessionOut)
+def reload_preview(session_id: str, body: StartPreviewRequest, db: DBSession = Depends(get_db)):
+    row = _get_session_or_404(session_id, db)
+    configure_genai(api_key=_resolve_key(body.api_key))
+
+    batch = _pick_preview_batch(row, db)
+    if not batch:
+        raise HTTPException(status_code=400, detail="No more readable resumes available to load.")
+
+    results = _run_preview_scoring(row, batch)
+    row.preview_iteration_count = (row.preview_iteration_count or 0) + 1
+
+    db.add(PreviewIteration(
+        session_id=session_id,
+        iteration_number=row.preview_iteration_count,
+        extra_params={"action": "reloaded_resumes"},
+        field_results=results,
+        synthesized_config_snapshot=row.synthesized_config or row.base_criteria,
+    ))
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 # ── step 4: accept + full evaluation ──────────────────────────────────────
 
 @router.post("/sessions/{session_id}/accept", response_model=SessionOut)
