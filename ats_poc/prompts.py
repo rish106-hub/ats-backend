@@ -181,6 +181,7 @@ Rules:
 4. confidence low = resume data insufficient to evaluate reliably.
    Flag for human review.
 5. Rank results array by overall_score descending.
+6. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years), treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS. However, if a candidate is massively overqualified (e.g., 4+ years for an intern/junior role asking for 1 year), they FAIL. Use common human judgement for overqualification. Always convert months to years accurately (12 months = 1 year).
 """.strip()
 
 GENERIC_SYSTEM = "You are a precise prompt testing assistant. Follow the user's instruction exactly."
@@ -247,6 +248,7 @@ Rules:
 6. overall_score: 0 to 100. baseline_pass false candidates score below 30.
 7. reasoning: 2-3 sentences. Reference specific field values, not generalities.
 8. Rank results array by overall_score descending.
+9. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years), treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS. However, if a candidate is massively overqualified (e.g., 4+ years for an intern/junior role asking for 1 year), they FAIL. Use common human judgement for overqualification. Always convert months to years accurately (12 months = 1 year).
 """.strip()
 
 CALL_SYNTHESIZE_SYSTEM = (
