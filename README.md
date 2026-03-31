@@ -24,8 +24,9 @@ FastAPI backend for the ATS Prompt Lab. Handles JD analysis, resume parsing, ite
 | POST | `/api/sessions/{id}/preview` | Run initial preview scoring |
 | POST | `/api/sessions/{id}/preview/refine` | Add params + re-synthesize + re-score |
 | POST | `/api/sessions/{id}/accept` | Accept criteria, run full evaluation (Call 3) |
+| GET | `/health` | Health check |
 
-## Setup
+## Local Setup
 
 ### Prerequisites
 
@@ -65,3 +66,34 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 API docs available at `http://localhost:8000/docs`
+
+## Railway Deployment
+
+### 1. Create a new Railway project
+
+In the [Railway dashboard](https://railway.app), create a new project and add:
+- A **PostgreSQL** plugin (Railway auto-provisions `DATABASE_URL`)
+- A service from this GitHub repo
+
+### 2. Set environment variables
+
+In the Railway service settings → Variables, add:
+
+| Variable | Value |
+|----------|-------|
+| `GOOGLE_API_KEY` | Your Gemini API key |
+
+`DATABASE_URL` is automatically injected by the Railway PostgreSQL plugin.
+
+### 3. Deploy
+
+Railway detects the `Procfile` and runs:
+```
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+Tables are created automatically on first startup.
+
+### 4. Wire the frontend
+
+Once deployed, copy the Railway public URL and set `NEXT_PUBLIC_API_URL` in the frontend deployment to point to it.
