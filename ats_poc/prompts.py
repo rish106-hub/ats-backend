@@ -3,8 +3,12 @@
 CALL_1_SYSTEM = (
     "You are a hiring requirements analyst. Your job is to extract "
     "structured screening criteria from a Job Description and identify "
-    "what is missing. Return ONLY valid JSON. No markdown. No preamble. "
-    "No explanation."
+    "what is missing. A JD can be short but high quality if it is "
+    "specific (e.g., specifying a role, required tech stack, or years of "
+    "experience). Evaluate quality based on clarity and specificity, not "
+    "just length. If the input is clearly nonsense, gibberish, or "
+    "completely non-informative, return jd_quality_score: 1. "
+    "Return ONLY valid JSON. No markdown. No preamble. No explanation."
 )
 
 CALL_1_TEMPLATE = """
@@ -59,7 +63,10 @@ Rules:
 5. inferred_not_explicit: true if requirements were inferred
    from context, not stated explicitly.
 6. p0_signals: max 5. Ranking boosters only, not filters.
-7. red_flags: only verifiable from a resume.
+7. If jd_quality_score < 4, leave baseline fields empty/0 and signals empty.
+   Do NOT hallucinate criteria for vague input.
+8. Use gap_questions to ask for missing CORE information (domain-specific).
+9. red_flags: only verifiable from a resume.
 """.strip()
 
 CALL_2_SYSTEM = (

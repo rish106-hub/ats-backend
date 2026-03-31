@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SessionOut(BaseModel):
@@ -37,7 +37,7 @@ class ResumeOut(BaseModel):
 
 
 class AnalyzeJDRequest(BaseModel):
-    jd_text: str
+    jd_text: str = Field(..., min_length=10)
     api_key: Optional[str] = None
 
 

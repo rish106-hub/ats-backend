@@ -101,6 +101,15 @@ def analyze_jd(session_id: str, body: AnalyzeJDRequest, db: DBSession = Depends(
         template=CALL_1_TEMPLATE,
         replacements={"JD_TEXT": body.jd_text},
     )
+    
+    quality_score = parsed.get("jd_quality_score", 0)
+    if quality_score < 6:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job Description quality score is low ({quality_score}/10). "
+                   "It may be too vague to extract reliable screening criteria. "
+                   "Please provide a more detailed description."
+        )
 
     row.jd_text = body.jd_text
     row.jd_analysis = parsed
