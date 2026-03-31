@@ -120,10 +120,12 @@ Return this exact JSON:
 Rules:
 1. final_evaluation_prompt: clear LLM instruction including all
    baseline checks, p0 signals, red flags, and scoring logic.
-2. required_resume_fields: ONLY fields actually needed for this
-   role from: name, education, work_experience, skills,
-   certifications, projects, publications, github_url,
-   total_experience_years, career_gaps_months
+123: 2. required_resume_fields: ONLY fields actually needed for this
+124:    specific JD's nature from: name, education, work_experience,
+125:    skills, certifications, projects, publications, github_url,
+126:    total_experience_years, career_gaps_months.
+127:    DO NOT include technical fields (github, projects) for
+128:    non-technical roles.
 3. p0 weights must add up to 100.
 4. screening_summary: 2 sentence plain English summary for a
    non-technical recruiter.
@@ -248,15 +250,17 @@ Rules:
 """.strip()
 
 CALL_SYNTHESIZE_SYSTEM = (
-    "You are a hiring criteria synthesis engine. You take a base set of hiring "
+    "You are a strict hiring criteria synthesis engine. You take a base set of hiring "
     "criteria and a history of recruiter-added include/exclude parameters, and "
-    "synthesize them into a single unified evaluation rubric. Preserve all base "
-    "criteria. Layer in recruiter preferences as tighter or looser filters and "
-    "updated P0 signals. Return ONLY valid JSON. No markdown. No preamble."
+    "synthesize them into a single unified evaluation rubric. Start with the base "
+    "criteria, but you MUST OVERRIDE, MODIFY, or RELAX any original criteria if a "
+    "recruiter's include/exclude parameter contradicts or broadens it (e.g. accepting "
+    "B.Tech instead of just MBA). You MUST explicitly translate every recruiter "
+    "parameter into the new strict criteria. Return ONLY valid JSON. No markdown."
 )
 
 CALL_SYNTHESIZE_TEMPLATE = """
-BASE CRITERIA (from JD analysis — do not remove any of these):
+BASE CRITERIA (from initial JD analysis):
 {{BASE_CRITERIA_JSON}}
 
 RECRUITER EXTRA PARAMETERS (accumulated across all iterations):
@@ -299,16 +303,20 @@ Synthesize all of the above into a single unified rubric. Return this exact JSON
 
 Rules:
 1. final_evaluation_prompt: comprehensive LLM instruction combining ALL
-   base criteria AND all recruiter extra parameters.
+   base criteria AND explicitly listing every single recruiter extra parameter.
+   These parameters MUST be prominently highlighted as mandatory instructions
+   for the grading model to follow!
 2. required_resume_fields: ONLY fields actually needed from: name, education,
    work_experience, skills, certifications, projects, publications, github_url,
    total_experience_years, career_gaps_months.
 3. p0_weights must sum to 100.
-4. Each "include" extra parameter should become either a new baseline_check
-   or an increase in p0_weight for a relevant signal.
-5. Each "exclude" extra parameter should become a new red_flag_check or a
-   tighter baseline_check.
+4. Each "include" extra parameter MUST become either a new mandatory baseline_check,
+   an increase in p0_weight, or a MODIFICATION to an existing baseline_check to make 
+   it broader/relaxed (e.g. changing "MBA required" to "MBA or equivalent required").
+5. Each "exclude" extra parameter MUST become a new red_flag_check, a
+   tighter mandatory baseline_check, or a MODIFICATION to remove an existing lenient 
+   criteria. You CANNOT ignore them.
 6. screening_summary: 2 sentences plain English for a non-technical recruiter.
-7. synthesis_notes: 2-3 sentences explaining what changed from the base
-   criteria and why (based on the recruiter parameters added).
+7. synthesis_notes: 2-3 sentences explicitly listing exactly which include/exclude 
+   parameters were added to the strict rubric constraints in this iteration.
 """.strip()

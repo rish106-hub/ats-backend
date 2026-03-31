@@ -40,7 +40,7 @@ from ats_poc.sample_selection import (
 router = APIRouter(prefix="/api")
 
 MODEL_NAME = "gemini-2.5-flash-lite"
-PREVIEW_BATCH_SIZE = 6
+PREVIEW_BATCH_SIZE = 2
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -233,16 +233,17 @@ def _run_synthesis(row: Session) -> dict:
     row.synthesized_config = parsed
     return parsed
 
-
 def _run_preview_scoring(row: Session, batch: list[dict]) -> dict:
-    """Run field-level scoring on the selected batch."""
+    """Run field-level scoring on the selected batch with JD-aware compression."""
+    criteria = row.synthesized_config or row.base_criteria or {}
+    required_fields = criteria.get("required_resume_fields", [])
+    
     resume_jsons = []
     for r in batch:
-        rj = dict(r["resume_json"])
+        rj = compress_resume(r["resume_json"], required_fields)
         if not rj.get("name"):
             rj["name"] = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
         resume_jsons.append(rj)
-    criteria = row.synthesized_config or row.base_criteria or {}
     parsed, _raw, usage, _prompt = run_structured_call(
         model_name=MODEL_NAME,
         system_instruction=CALL_PREVIEW_SYSTEM,
