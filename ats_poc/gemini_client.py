@@ -118,7 +118,12 @@ def run_structured_call(
 ) -> tuple[Any, str, dict[str, int], str]:
     final_prompt = render_template(template, replacements)
     raw_text, usage = generate_response(model_name, system_instruction, final_prompt, temperature)
-    parsed_json = extract_json_from_text(raw_text)
+    print(f"Gemini call to {model_name} total tokens: {usage.get('total_tokens', 0)}")
+    try:
+        parsed_json = extract_json_from_text(raw_text)
+    except Exception as exc:
+        print(f"FAILED TO PARSE JSON: {raw_text[:200]}...")
+        raise exc
     return parsed_json, raw_text, usage, final_prompt
 
 

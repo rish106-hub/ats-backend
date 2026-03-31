@@ -39,7 +39,7 @@ from ats_poc.sample_selection import (
 
 router = APIRouter(prefix="/api")
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"
 PREVIEW_BATCH_SIZE = 6
 
 
@@ -130,7 +130,7 @@ async def upload_resumes(
     for f in files:
         pdf_bytes = await f.read()
         try:
-            parsed = parse_resume_pdf(pdf_bytes)
+            parsed = parse_resume_pdf(f.filename, pdf_bytes)
         except Exception as exc:
             parsed = {
                 "file_name": f.filename,
@@ -345,6 +345,7 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
         },
     )
     _accumulate_tokens(row, "Call 3", usage)
+    print(f"Call 3 success. Result keys: {parsed.keys() if isinstance(parsed, dict) else 'not a dict'}")
     row.full_results = parsed
     row.status = "completed"
 
