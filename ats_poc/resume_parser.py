@@ -93,14 +93,19 @@ def sectionize_resume(lines: list[str]) -> dict[str, list[str]]:
 
 
 def parse_name(lines: list[str]) -> str:
-    for line in lines[:6]:
+    for line in lines[:8]:
         lower = line.lower()
         if any(word in lower for word in GENERIC_CONTACT_WORDS):
             continue
         if "@" in line or re.search(r"\+?\d[\d\s\-()]{7,}", line):
             continue
-        if 1 <= len(line.split()) <= 5 and re.fullmatch(r"[A-Za-z .'-]+", line):
-            return line.strip()
+        # Accept Latin, Indian (Devanagari etc.), dots, hyphens, apostrophes
+        clean = line.strip()
+        if 1 <= len(clean.split()) <= 5 and len(clean) <= 60:
+            # Must have at least one letter; reject pure-symbol/number lines
+            if re.search(r"[A-Za-z\u0900-\u097F\u0980-\u09FF]", clean):
+                if not re.search(r"[\[\]|\\<>{}()=+*&^%$#!\'\"]+", clean):
+                    return clean
     return ""
 
 
@@ -373,3 +378,4 @@ def parse_resume_pdf(file_name: str, file_bytes: bytes) -> dict[str, Any]:
         "resume_json": resume_json,
         "quality": quality,
     }
+

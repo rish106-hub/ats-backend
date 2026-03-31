@@ -227,7 +227,12 @@ def _run_synthesis(row: Session) -> dict:
 
 def _run_preview_scoring(row: Session, batch: list[dict]) -> dict:
     """Run field-level scoring on the selected batch."""
-    resume_jsons = [r["resume_json"] for r in batch]
+    resume_jsons = []
+    for r in batch:
+        rj = dict(r["resume_json"])
+        if not rj.get("name"):
+            rj["name"] = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
+        resume_jsons.append(rj)
     criteria = row.synthesized_config or row.base_criteria or {}
     parsed, _raw, usage, _prompt = run_structured_call(
         model_name=MODEL_NAME,
@@ -330,7 +335,15 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
         keywords = extract_keywords(row.jd_text or "", row.base_criteria or {}, config or {})
         batch = pick_representative_sample(resume_dicts, keywords, sample_size=15)
 
-    compressed = [compress_resume(r["resume_json"], required_fields) for r in batch]
+    # Always include name so Gemini can identify candidates; fall back to filename
+    compressed = []
+    for r in batch:
+        c = compress_resume(r["resume_json"], required_fields)
+        parsed_name = r["resume_json"].get("name", "")
+        if not parsed_name:
+            parsed_name = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
+        c["name"] = parsed_name
+        compressed.append(c)
     rubric = config.get("scoring_rubric", {}) if config else {}
     prompt_text = config.get("final_evaluation_prompt", "") if config else ""
 
