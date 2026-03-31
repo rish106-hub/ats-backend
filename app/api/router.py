@@ -217,8 +217,8 @@ def _run_silent_call2(row: Session) -> dict:
     return parsed
 
 
-def _run_synthesis(row: Session) -> dict:
-    """Synthesize base criteria + all extra params into updated config."""
+def _run_synthesis(row: Session, candidate_feedback: list[dict] = None) -> dict:
+    """Synthesize base criteria + all extra params + human feedback into updated config."""
     parsed, _raw, usage, _prompt = run_structured_call(
         model_name=MODEL_NAME,
         system_instruction=CALL_SYNTHESIZE_SYSTEM,
@@ -226,6 +226,7 @@ def _run_synthesis(row: Session) -> dict:
         replacements={
             "BASE_CRITERIA_JSON": row.base_criteria or {},
             "EXTRA_PARAMS_HISTORY": row.extra_params_history or [],
+            "CANDIDATE_FEEDBACK_JSON": candidate_feedback or [],
             "PREVIEW_RESULTS_JSON": row.preview_field_results or {},
         },
     )
@@ -300,7 +301,8 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
         })
         row.extra_params_history = history
 
-    _run_synthesis(row)
+    feedback_dicts = [fb.model_dump() for fb in body.candidate_feedback] if body.candidate_feedback else []
+    _run_synthesis(row, feedback_dicts)
     batch = _pick_preview_batch(row, db)
     if not batch:
         raise HTTPException(status_code=400, detail="No readable resumes found.")

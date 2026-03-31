@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -45,10 +45,16 @@ class StartPreviewRequest(BaseModel):
     api_key: Optional[str] = None
 
 
+class CandidateFeedback(BaseModel):
+    file_name: str
+    action: str
+    reason: str
+
 class RefineRequest(BaseModel):
     include: str = ""
     exclude: str = ""
     api_key: Optional[str] = None
+    candidate_feedback: List[CandidateFeedback] = Field(default_factory=list)
 
 
 class AcceptRequest(BaseModel):

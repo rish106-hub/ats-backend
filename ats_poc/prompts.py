@@ -253,12 +253,11 @@ Rules:
 
 CALL_SYNTHESIZE_SYSTEM = (
     "You are a strict hiring criteria synthesis engine. You take a base set of hiring "
-    "criteria and a history of recruiter-added include/exclude parameters, and "
-    "synthesize them into a single unified evaluation rubric. Start with the base "
-    "criteria, but you MUST OVERRIDE, MODIFY, or RELAX any original criteria if a "
-    "recruiter's include/exclude parameter contradicts or broadens it (e.g. accepting "
-    "B.Tech instead of just MBA). You MUST explicitly translate every recruiter "
-    "parameter into the new strict criteria. Return ONLY valid JSON. No markdown."
+    "criteria, a history of recruiter-added parameters, AND manual candidate-level feedback. "
+    "Start with the base criteria, but you MUST OVERRIDE, MODIFY, or RELAX any original criteria if a "
+    "recruiter's parameter or feedback contradicts or broadens it (e.g. accepting "
+    "B.Tech instead of just MBA). You MUST explicitly reverse-engineer the hiring manager's "
+    "candidate-level feedback into new strict criteria. Return ONLY valid JSON. No markdown."
 )
 
 CALL_SYNTHESIZE_TEMPLATE = """
@@ -267,6 +266,9 @@ BASE CRITERIA (from initial JD analysis):
 
 RECRUITER EXTRA PARAMETERS (accumulated across all iterations):
 {{EXTRA_PARAMS_HISTORY}}
+
+HIRING MANAGER MANUAL CANDIDATE FEEDBACK:
+{{CANDIDATE_FEEDBACK_JSON}}
 
 LAST PREVIEW RESULTS (for context — shows what the current criteria produced):
 {{PREVIEW_RESULTS_JSON}}
@@ -321,4 +323,7 @@ Rules:
 6. screening_summary: 2 sentences plain English for a non-technical recruiter.
 7. synthesis_notes: 2-3 sentences explicitly listing exactly which include/exclude 
    parameters were added to the strict rubric constraints in this iteration.
+8. If CANDIDATE_FEEDBACK_JSON is provided, you MUST analyze why the manager agreed 
+   or disagreed with a candidate's score, and formulate a new baseline_check, p0_weight, 
+   or red_flag_check to guarantee that constraint is strictly enforced moving forward.
 """.strip()
