@@ -8,16 +8,29 @@ import re
 import time
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+
+
+# Module-level client — reconfigured per-request via configure_genai()
+_client: genai.Client | None = None
 
 
 def configure_genai(api_key: str | None = None) -> str:
-    """Configure the Gemini SDK and return the resolved API key."""
+    """Configure the Gemini client and return the resolved API key."""
+    global _client
     resolved_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not resolved_key:
         raise ValueError("Missing GOOGLE_API_KEY or GEMINI_API_KEY.")
-    genai.configure(api_key=resolved_key)
+    _client = genai.Client(api_key=resolved_key)
     return resolved_key
+
+
+def _get_client() -> genai.Client:
+    if _client is None:
+        # Auto-init from env if configure_genai() hasn't been called yet
+        configure_genai()
+    return _client  # type: ignore[return-value]
 
 
 def render_template(template: str, replacements: dict[str, Any]) -> str:
@@ -29,22 +42,6 @@ def render_template(template: str, replacements: dict[str, Any]) -> str:
             serialized = str(value)
         rendered = rendered.replace(f"{{{{{key}}}}}", serialized)
     return rendered
-
-
-def _response_text(response: Any) -> str:
-    text = getattr(response, "text", None)
-    if text:
-        return text.strip()
-
-    chunks: list[str] = []
-    for candidate in getattr(response, "candidates", []) or []:
-        content = getattr(candidate, "content", None)
-        parts = getattr(content, "parts", []) if content else []
-        for part in parts:
-            maybe_text = getattr(part, "text", None)
-            if maybe_text:
-                chunks.append(maybe_text)
-    return "\n".join(chunks).strip()
 
 
 def extract_json_from_text(text: str) -> Any:
@@ -73,18 +70,18 @@ def extract_json_from_text(text: str) -> Any:
     return json.loads(snippet)
 
 
-def usage_to_dict(response: Any) -> dict[str, int]:
-    usage = getattr(response, "usage_metadata", None)
-    if not usage:
-        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+def _usage_to_dict(usage_metadata: Any, elapsed: float) -> dict[str, Any]:
+    if not usage_metadata:
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "latency_seconds": round(elapsed, 2)}
 
-    input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
-    output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
-    total_tokens = int(getattr(usage, "total_token_count", input_tokens + output_tokens) or 0)
+    input_tokens = int(getattr(usage_metadata, "prompt_token_count", 0) or 0)
+    output_tokens = int(getattr(usage_metadata, "candidates_token_count", 0) or 0)
+    total_tokens = int(getattr(usage_metadata, "total_token_count", input_tokens + output_tokens) or 0)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "latency_seconds": round(elapsed, 2),
     }
 
 
@@ -93,20 +90,29 @@ def generate_response(
     system_instruction: str,
     user_prompt: str,
     temperature: float = 0.2,
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, Any]]:
     started_at = time.perf_counter()
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=system_instruction,
-        generation_config={
-            "temperature": temperature,
-            "response_mime_type": "application/json",
-        },
+    client = _get_client()
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=temperature,
+            response_mime_type="application/json",
+            # Disable thinking mode — Gemini 2.5 models run extended internal
+            # chain-of-thought by default, which can take 60–180s before producing
+            # any output. thinking_budget=0 switches to direct generation (5–15s).
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            http_options=types.HttpOptions(timeout=90_000),
+        ),
     )
-    response = model.generate_content(user_prompt)
-    usage = usage_to_dict(response)
-    usage["latency_seconds"] = round(time.perf_counter() - started_at, 2)
-    return _response_text(response), usage
+
+    elapsed = time.perf_counter() - started_at
+    raw_text = (response.text or "").strip()
+    usage = _usage_to_dict(response.usage_metadata, elapsed)
+    return raw_text, usage
 
 
 def run_structured_call(
@@ -115,10 +121,10 @@ def run_structured_call(
     template: str,
     replacements: dict[str, Any],
     temperature: float = 0.2,
-) -> tuple[Any, str, dict[str, int], str]:
+) -> tuple[Any, str, dict[str, Any], str]:
     final_prompt = render_template(template, replacements)
     raw_text, usage = generate_response(model_name, system_instruction, final_prompt, temperature)
-    print(f"Gemini call to {model_name} total tokens: {usage.get('total_tokens', 0)}")
+    print(f"Gemini call to {model_name} | {usage.get('total_tokens', 0)} tokens | {usage.get('latency_seconds', 0)}s")
     try:
         parsed_json = extract_json_from_text(raw_text)
     except Exception as exc:
@@ -132,7 +138,7 @@ def run_raw_call(
     system_instruction: str,
     user_prompt: str,
     temperature: float = 0.2,
-) -> tuple[str, dict[str, int], Any | None]:
+) -> tuple[str, dict[str, Any], Any | None]:
     raw_text, usage = generate_response(model_name, system_instruction, user_prompt, temperature)
     parsed_json = None
     try:

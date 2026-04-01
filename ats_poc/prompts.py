@@ -57,6 +57,36 @@ CALL_1_SYSTEM = (
     "There must be a signal asking whether the candidate has actually produced this type "
     "of output in a professional setting — not just claimed to. "
     "\n\n"
+    "PROXY THINKING RULE: "
+    "Experienced hiring managers do not run a 7-question checklist. They use proxies — "
+    "a single observable combination of facts that efficiently encodes what would otherwise "
+    "be 3-4 separate questions. Before finalising your signals, ask: are any of my questions "
+    "really the same underlying concern approached from different angles? If so, collapse them "
+    "into one proxy signal that names the combination of observable facts that answers all of "
+    "them simultaneously. "
+    "A proxy signal is COMBINATORIAL, not additive. Instead of asking separately about "
+    "professional legitimacy, domain fit, and work depth — combine them: 'Has this person "
+    "spent time in a company where product work was core to the business (not a side team), "
+    "in a role that was actually theirs to own, long enough to see the consequences of their "
+    "decisions? That combination tells me professional context, real ownership, and relevant "
+    "depth all at once.' "
+    "Proxy patterns to look for: "
+    "COMPANY TYPE + ROLE TITLE + TENURE: Time at a relevant company, at the right level, "
+    "for the right duration is a three-in-one proxy for domain fit, professional legitimacy, "
+    "and work depth. A year at a consumer internet company as a PM is more signal than any "
+    "three separate questions about consumer experience, professional PM work, and time spent. "
+    "TITLE PROGRESSION AT THE SAME EMPLOYER: Promotions within a single company are a proxy "
+    "for quality of work AND trajectory — an external third party (the employer) decided this "
+    "person was worth promoting, which is more credible than any self-reported claim. "
+    "STARTUP STAGE + SCOPE + TEAM SIZE: Being a senior IC or first PM at a seed-stage company "
+    "proxies for operating under constraint, wearing multiple hats, and shipping without "
+    "infrastructure — directly relevant for builder archetypes. "
+    "DOMAIN TRACK RECORD + OUTPUT TYPE: Having spent 2+ years producing the specific type of "
+    "output this role demands (PRDs, roadmaps, data dashboards, financial models) at a company "
+    "in a relevant sector is a proxy for craft competency + domain fit + deliverable quality. "
+    "Apply proxy thinking to produce FEWER, RICHER signals. A list of 4 proxy signals that "
+    "each encode multiple dimensions beats 7 checklist questions every time. "
+    "\n\n"
     "HONESTY RULE: If the JD is too vague to produce a meaningful signal, do not fabricate. "
     "Flag the gap in gap_questions instead. "
     "Return ONLY valid JSON. No markdown. No preamble. No explanation."
@@ -79,6 +109,30 @@ What's the minimum real-work evidence this person must have to even be considere
 Think about: professional vs. academic experience, domain relevance, work complexity,
 evidence that the experience is real not just listed. What's BEHIND their resume —
 is the foundation solid or thin?
+
+STEP 2B — SCAN FOR CONCRETE SPECIFICS (completeness check — do not skip)
+Before writing any baseline signal, list every concrete, verifiable fact in the JD:
+- Exact experience duration stated (e.g. "1–1.5 years", "4+ years")
+- Specific craft outputs required (e.g. "write PRDs", "run A/B tests", "build dashboards",
+  "manage a P&L", "write SQL queries", "produce financial models")
+- Domain or context constraints (e.g. "consumer internet", "B2B SaaS", "early-stage startup",
+  "regulated industry", "specific geography")
+- Organizational context clues (e.g. "cross-functional collaboration", "report to CTO",
+  "first PM hire", "0-to-1 product building")
+Every item on this list MUST appear as a dimension in at least one baseline_signal.
+If any is missing after you write your signals, add it. Skipping a concrete JD fact is a failure.
+
+STEP 2C — COLLAPSE INTO PROXIES (do this AFTER the completeness scan)
+Review every baseline signal you drafted. For any two or three signals that are really asking
+about the same underlying concern from different angles — professional legitimacy, domain fit,
+real ownership, craft competency — ask: is there a single observable combination of facts
+(company type + role title + tenure, title progression, startup stage + scope, output type +
+domain) that would answer ALL of them simultaneously?
+If yes, collapse those signals into one proxy signal that explicitly names the combination.
+Proxy signals are more powerful than checklist questions because they reflect how HMs actually
+think: they pattern-match to a mental model, they don't run a 7-item quiz.
+After collapsing, you should have FEWER signals (3–6 is ideal) that are each RICHER and more
+specific than a list of separate questions would be.
 
 STEP 3 — WHAT WOULD MAKE AN HM EXCITED? (P0 signals)
 What's the signal that puts this resume at the top of the pile?
@@ -143,22 +197,33 @@ Rules:
           not a contributor to someone else's architecture, but the person responsible
           when things broke and accountable for making them better."
 
-2. baseline_signals: 4 to 7 strings. Each is a recruiter's internal floor-check thought.
+2. baseline_signals: 3 to 6 strings. Each is a recruiter's internal floor-check thought.
    - MUST be about WORK DONE, not skills listed
    - MUST be phrased as an evaluative thought — not a requirement, a question about evidence:
      "Has this person...", "Do they have evidence of...", "Is their experience...",
      "Does their background show...", "Does the work show..."
    - MUST be specific to THIS JD — not a generic statement applicable to any role
-   - MUST collectively cover: professional vs. hobby depth, domain/context relevance,
-     work complexity and trajectory, and any hard non-negotiables the JD states
+   - MUST collectively cover all four completeness dimensions (from COMPLETENESS RULE):
+     experience threshold, technical/craft competency, domain specificity, deliverable evidence
+   - PREFER PROXY SIGNALS: where multiple dimensions can be answered by a single observable
+     combination of facts, write one proxy signal instead of multiple separate questions.
+     Proxy signal format: "Has this person spent [duration] at a [company type] in a [role type]
+     where [output type] was their direct responsibility — because that combination tells me
+     [professional legitimacy] + [domain fit] + [craft evidence] at once?"
+     Other proxy patterns: title progression at one employer, startup stage + scope,
+     output type + domain track record.
    Bad: "Candidate must have React experience"
    Bad: "4+ years of backend experience required"
+   Bad: Three separate signals asking about "professional experience", "consumer domain",
+        and "PM craft" when a single proxy covers all three.
    Good: "Has this person actually shipped React applications to production with real
           users — not just tutorial projects — and is there work they owned, not just
           a team output they were part of?"
-   Good: "Do they have 4+ years of professional backend work, and more importantly,
-          does that time show increasing complexity and ownership rather than the same
-          scope repeated across different companies?"
+   Good: "Have they spent at least a year as an actual PM — not a PM intern, not a
+          'growth analyst who did some PM work' — at a company where a real product
+          with real users was their responsibility? That combination of role, context,
+          and duration tells me professional legitimacy, domain relevance, and real
+          ownership all at once."
 
 3. p0_signals: 3 to 5 strings. Each is an HM's excitement trigger.
    - MUST be about ownership, impact, trajectory, or problem-match BEYOND the baseline
