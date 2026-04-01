@@ -45,12 +45,18 @@ def extract_keywords(
 ) -> list[str]:
     keywords = set(tokenize(jd_text))
     if jd_analysis:
-        baseline = jd_analysis.get("baseline", {})
-        for skill in baseline.get("skills_required", []):
-            keywords.update(tokenize(skill))
-        keywords.update(tokenize(baseline.get("domain_required", "")))
+        # Signal-based format: baseline_signals and p0_signals are plain strings
+        for signal in jd_analysis.get("baseline_signals", []):
+            keywords.update(tokenize(signal))
         for signal in jd_analysis.get("p0_signals", []):
-            keywords.update(tokenize(signal.get("signal", "")))
+            keywords.update(tokenize(signal))
+        # red_flags is object[] with .flag field
+        for flag in jd_analysis.get("red_flags", []):
+            flag_text = flag.get("flag", "") if isinstance(flag, dict) else str(flag)
+            keywords.update(tokenize(flag_text))
+        # domain context from role_context
+        role_context = jd_analysis.get("role_context", {})
+        keywords.update(tokenize(role_context.get("domain_constraints", "")))
     if final_config:
         rubric = final_config.get("scoring_rubric", {})
         for check in rubric.get("baseline_checks", []):
