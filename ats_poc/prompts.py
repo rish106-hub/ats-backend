@@ -346,17 +346,41 @@ Return this exact JSON:
 }
 
 Rules:
-1. baseline_checks: one entry per baseline_signal. The "check" field must name the
-   specific concrete evidence in a resume that answers the signal's question.
+1. baseline_checks: one entry per baseline_signal. The "check" field MUST explicitly state:
+   (a) PASSES: what specific resume evidence definitively satisfies this check — name the
+       field, the language pattern, the minimum scope/duration/depth required.
+   (b) FAILS: at least 2–3 explicit edge cases that look like passing but do NOT pass.
+   Write the check as a single string that contains both. Format:
+   "work_experience contains [specific evidence]. FAILS if: [edge case 1]; [edge case 2]; [edge case 3]."
+
+   Mandatory edge cases to consider for every check (include whichever apply to this signal):
+   - All roles are internships or academic/capstone projects with no professional employment
+   - All descriptions use contribution language only ('worked on', 'helped build', 'part of team') — no first-person owned outcomes
+   - Title claims the role (e.g. 'Product Manager') but deliverables described are for a different function (QA/support/testing/dev)
+   - Claimed years of experience are actually months of internship time, not FTE tenure
+   - Experience exists but is entirely in a different scope (e.g. feature-level only when role requires product-level ownership)
+
    Example signal: "Has this person shipped backend services to production with real users?"
    Example check: "work_experience contains at least one role with explicit evidence of
-                   production deployment — live users, uptime responsibility, or on-call"
+                   production deployment — live users, uptime responsibility, or on-call.
+                   FAILS if: all experience is academic/side projects without production users;
+                   role says 'engineer' but descriptions only mention internal tooling with no
+                   external users; contributions described as 'helped migrate' with no owned
+                   service or clear accountability."
    Example resume_field: "work_experience"
 
 2. p0_weights: one entry per p0_signal. "signal" names the evidence an LLM would look
    for in a resume to answer the HM's excitement question positively.
-   Weights must sum to exactly 100. Weight ownership and problem-match signals higher
-   than trajectory or credential signals.
+   Weights must sum to exactly 100.
+
+   Weight differentiation is REQUIRED:
+   - Ownership and problem-match signals (did they own the outcome, do they understand the problem): 30–40 each
+   - Growth/trajectory signals (scope expansion, increasing responsibility): 15–20 each
+   - Craft/technical signals (specific tool, method, or skill proficiency): 10–15 each
+   - Equal weights (e.g. 25/25/25/25) are only acceptable if all signals are genuinely
+     indistinguishable in importance — if so, add a "weight_justification" note explaining why.
+   - The highest-weighted signal must be at least 10 points above the lowest-weighted signal.
+   - Assign the highest weight to the signal that most differentiates a strong hire from a mediocre one.
 
 3. red_flag_checks: one entry per red_flag. Use the risk_type to write a precise,
    observable check. Example for "ownership_language": "All work_experience descriptions
@@ -372,11 +396,89 @@ Rules:
    - Instructs: evaluate baseline first → reject on any failure → score p0 for passing
      candidates → flag red flags → be conservative, do not infer evidence not in resume
 
+   The prompt MUST contain these three additional sections after the baseline filters:
+
+   WHAT COUNTS (one sentence per baseline filter):
+     For each hard filter, state exactly what resume text definitively passes it — specific
+     language, field, scope. E.g. "FILTER 1 PASSES if: work_experience has a role with
+     explicit first-person ownership language and a named shipped product/feature with
+     real users."
+
+   WHAT DOES NOT COUNT (one sentence per baseline filter):
+     For each hard filter, name the specific edge cases that do NOT satisfy it despite
+     looking plausible. E.g. "FILTER 1 FAILS for: internships described as full-time;
+     'PM' title with deliverables that are QA scripts or test plans; 'launched' used
+     for an internal tool with no external users."
+
+   SCORING CALIBRATION (3 anchor points derived from the role's specific p0 signals):
+     P0 score 80–100: candidate shows [role-specific description of what top looks like]
+     P0 score 50–79: candidate shows [role-specific description of what mid looks like]
+     P0 score below 50: candidate shows [role-specific description of what weak looks like]
+     These anchors must be derived from the actual p0 signals and weights, not generic text.
+
 5. required_resume_fields: only fields referenced by at least one check or signal.
    Always include "name". Do not include unused fields.
 
 6. screening_summary: 2 plain English sentences for a non-technical recruiter describing
    who passes the baseline and what the top P0 differentiator is.
+""".strip()
+
+CALL_LENS_SYSTEM = (
+    "You are an experienced recruiter reading a resume pile for a specific role. "
+    "For each resume, write honest, specific internal notes — what you actually observe "
+    "about this candidate's ownership history, domain background, craft evidence, career "
+    "trajectory, and fit for this specific role. "
+    "You are reading the full resume text, not a summary. Your notes replace the need for "
+    "the downstream scoring model to re-read the raw text — so they must be accurate, "
+    "specific, and capture anything that would matter to a recruiter or hiring manager. "
+    "Never write generic filler. If a dimension is absent from the resume, say so explicitly. "
+    "Return ONLY valid JSON array. No markdown. No preamble."
+)
+
+CALL_LENS_TEMPLATE = """
+You are screening candidates for the following role.
+
+Role Type: {{ROLE_TYPE}}
+Context: {{ROLE_CONTEXT}}
+Ideal candidate: {{ONE_LINER}}
+
+Floor checks (what recruiter needs to see before proceeding):
+{{BASELINE_SIGNALS}}
+
+HM excitement triggers (what puts a resume at the top of the pile):
+{{P0_SIGNALS}}
+
+Recruiter's JD clarifications (gap question context — calibrate your reading against these;
+e.g. if a cloud platform was clarified as "AWS required", note AWS-specific evidence or
+its absence in craft_signals):
+{{GAP_ANSWERS}}
+
+Read each resume below through this specific role lens.
+
+RESUMES:
+{{RESUMES}}
+
+Return this exact JSON (array, one object per resume, in the same order as input):
+
+[
+  {
+    "file_name": "",
+    "ownership_arc": "Career ownership narrative — what they owned vs. contributed to, at which companies, in which roles, for how long. Name specific companies and roles.",
+    "domain_proximity": "How close is their background to this role's domain — consumer/B2B, startup/enterprise, vertical, scale. Be explicit about gaps.",
+    "craft_signals": "Specific deliverables, artifacts, or outputs produced in prior roles that are relevant to what this role demands. State what is absent if not found.",
+    "experience_profile": "Nature of the experience — professional vs. academic, product-first vs. service company, tenure pattern. Total years and quality of those years.",
+    "trajectory": "Growth pattern — promotions, scope expansion, stagnation. Is this person becoming harder to find or easier?",
+    "hm_flag": "The one thing an HM would want to probe in an interview, or the one gap that could disqualify. Be honest and specific — not diplomatic. If no concern, say so.",
+    "red_flag_notes": "Observable HR-lens patterns: passive ownership language, short tenures without reason, domain mismatch, academic-only work. Write 'None' if clean."
+  }
+]
+
+Rules:
+1. Each field must be a specific factual observation — not 'strong background' but 'X years at Y doing Z'
+2. If a dimension is not present in the resume, state it explicitly: 'No mention of PRD writing anywhere in this resume'
+3. hm_flag must be honest. If no concern exists, write 'No obvious flag — strong fit across baseline dimensions'. Do not fabricate concerns.
+4. Keep each field under 60 words. Dense and specific, not padded.
+5. file_name must match exactly the file_name you received in the RESUMES input.
 """.strip()
 
 CALL_3_SYSTEM = (
@@ -393,8 +495,16 @@ SCREENING CRITERIA:
 SCORING RUBRIC:
 {{SCORING_RUBRIC_JSON}}
 
-RESUMES (relevant fields only):
+CANDIDATES:
 {{ARRAY_OF_15_COMPRESSED_RESUMES}}
+
+Each candidate entry has two layers:
+- "lens": A recruiter's honest reading of this resume for this specific role — covering
+  ownership arc, domain proximity, craft signals, experience profile, trajectory, HM flag,
+  and red flag notes. Use this for qualitative signal judgment.
+- Verifiable raw fields (total_experience_years, education, career_gaps_months, etc.):
+  Use these to check hard thresholds — years of experience, credentials, gaps.
+  If the lens and a verifiable field conflict, trust the verifiable field.
 
 Return this JSON:
 
@@ -425,11 +535,14 @@ Return this JSON:
 Rules:
 1. overall_score: 0 to 100.
 2. baseline_pass false = automatic Reject regardless of p0_score.
-3. reasoning: 2-3 sentences max. Specific, not generic.
-4. confidence low = resume data insufficient to evaluate reliably.
-   Flag for human review.
+3. reasoning: 2-3 sentences max. Reference specifics from the lens — ownership arc,
+   domain proximity, craft signals — not just field values. Be concrete.
+4. confidence low = lens and verifiable fields are sparse or contradictory. Flag for human review.
 5. Rank results array by overall_score descending.
-6. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years), treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS. However, if a candidate is massively overqualified (e.g., 4+ years for an intern/junior role asking for 1 year), they FAIL. Use common human judgement for overqualification. Always convert months to years accurately (12 months = 1 year).
+6. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years),
+   treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS.
+   Massive overqualification (e.g., 4+ years for a role asking for 1 year) FAILS.
+   Always convert months to years accurately (12 months = 1 year).
 """.strip()
 
 GENERIC_SYSTEM = "You are a precise prompt testing assistant. Follow the user's instruction exactly."
@@ -445,8 +558,16 @@ CALL_PREVIEW_TEMPLATE = """
 SCREENING CRITERIA (baseline + P0 signals + extra parameters):
 {{CRITERIA_JSON}}
 
-RESUMES (full JSON, 5-6 candidates):
+CANDIDATES:
 {{RESUME_JSON_ARRAY}}
+
+Each candidate entry has two layers:
+- "lens": A recruiter's honest reading of this resume for this specific role — covering
+  ownership arc, domain proximity, craft signals, experience profile, trajectory, HM flag,
+  and red flag notes. Use this for qualitative signal judgment.
+- Verifiable raw fields (total_experience_years, education, career_gaps_months, etc.):
+  Use these to check hard thresholds — years of experience, credentials, gaps.
+  If the lens and a verifiable field conflict, trust the verifiable field.
 
 For each resume, return a detailed field-level analysis. Return this exact JSON:
 
@@ -482,57 +603,137 @@ For each resume, return a detailed field-level analysis. Return this exact JSON:
 }
 
 Rules:
-1. field_matches: include one entry per resume field that was checked.
-   Use the actual field names from the resume JSON: name, education,
-   work_experience, skills, certifications, projects, total_experience_years.
-2. criteria_checked: quote the specific criterion from SCREENING CRITERIA
-   that was applied to this field.
+1. field_matches: include one entry per dimension checked. When a lens field was used
+   (ownership_arc, domain_proximity, craft_signals, etc.), use that as the field name.
+   When a verifiable raw field was used (total_experience_years, education), use that field name.
+2. criteria_checked: quote the specific criterion from SCREENING CRITERIA that was applied.
 3. match values:
-   - "pass" = field clearly satisfies the criterion
-   - "fail" = field clearly fails the criterion
-   - "partial" = field partially satisfies (e.g. related but not exact skill)
+   - "pass" = clearly satisfies the criterion
+   - "fail" = clearly fails the criterion
+   - "partial" = partially satisfies (related but not exact)
 4. extra_param_matches: list which extra parameters (if any) this candidate satisfies.
 5. baseline_pass false = automatic Reject regardless of p0_score.
 6. overall_score: 0 to 100. baseline_pass false candidates score below 30.
-7. reasoning: 2-3 sentences. Reference specific field values, not generalities.
+7. reasoning: 2-3 sentences. Reference specifics from the lens — ownership arc, domain
+   proximity, craft signals — not just raw field values. Be concrete and honest.
 8. Rank results array by overall_score descending.
-9. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years), treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS. However, if a candidate is massively overqualified (e.g., 4+ years for an intern/junior role asking for 1 year), they FAIL. Use common human judgement for overqualification. Always convert months to years accurately (12 months = 1 year).
+9. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years),
+   treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS.
+   Massive overqualification (e.g., 4+ years for a role asking for 1 year) FAILS.
+   Always convert months to years accurately (12 months = 1 year).
 """.strip()
 
 CALL_SYNTHESIZE_SYSTEM = (
-    "You are a strict hiring criteria synthesis engine. You take a base set of hiring "
-    "criteria, a history of recruiter-added parameters, AND manual candidate-level feedback. "
-    "Start with the base criteria, but you MUST OVERRIDE, MODIFY, or RELAX any original criteria if a "
-    "recruiter's parameter or feedback contradicts or broadens it (e.g. accepting "
-    "B.Tech instead of just MBA). You MUST explicitly reverse-engineer the hiring manager's "
-    "candidate-level feedback into new strict criteria. Return ONLY valid JSON. No markdown."
+    "You are a hiring criteria synthesis engine. Your job is to produce a single, coherent, "
+    "non-contradictory rubric that reflects the recruiter's CURRENT preferences — not the JD's "
+    "original requirements. The base criteria is your starting point, not your anchor. "
+    "\n\n"
+    "When a recruiter adds an include or exclude parameter, it represents a deliberate update "
+    "to their hiring bar. Your job is to propagate that change all the way through the rubric — "
+    "including modifying or demoting any existing baseline_check that now conflicts with it. "
+    "A rubric that has 'consumer internet required — REJECT if missing' alongside a recruiter "
+    "instruction 'include candidates without consumer internet' is broken. You must resolve "
+    "the conflict, not preserve both. "
+    "\n\n"
+    "RESOLUTION RULES: "
+    "If an include parameter RELAXES or CONTRADICTS a baseline_check: set reject_if_missing "
+    "to false on that check, rewrite the check text to reflect the new standard, or remove the "
+    "check entirely if the recruiter is saying the dimension no longer matters. You may convert "
+    "it to a p0_weight (preference, not filter) if the recruiter is relaxing but not eliminating. "
+    "If an exclude parameter TIGHTENS or ADDS a constraint: add or strengthen a baseline_check "
+    "or red_flag_check. Never keep a lenient existing check alongside a tightening exclude. "
+    "If candidate feedback implies a pattern: extract the generalised principle and encode it "
+    "as a check. Do not just remember the specific candidate — derive the rule. "
+    "\n\n"
+    "The final_evaluation_prompt is the ONLY thing the grading model sees. Every constraint, "
+    "relaxation, and feedback-derived rule must be explicitly stated in it — nothing implicit. "
+    "Return ONLY valid JSON. No markdown. No preamble."
 )
 
 CALL_SYNTHESIZE_TEMPLATE = """
-BASE CRITERIA (from initial JD analysis):
+BASE CRITERIA (starting point — any check can be relaxed, demoted, or removed by recruiter parameters):
 {{BASE_CRITERIA_JSON}}
 
-Note: BASE_CRITERIA_JSON uses a signal-based format:
-- "one_liner": one-sentence ideal candidate profile
-- "baseline_signals": recruiter floor-check thoughts as evaluative strings — each asks
-  whether the candidate has actually done the required work at the required depth.
-  These map to baseline_checks (hard filters, reject_if_missing: true).
-- "p0_signals": HM excitement thoughts as evaluative strings — each asks about ownership,
-  impact, trajectory, or problem-match beyond the baseline.
-  These map to p0_weights.
-- "red_flags": HR risk patterns, each with "flag" text and "risk_type"
-- "role_context": org stage, seniority, archetype — use to frame the evaluation prompt
+BASE_CRITERIA_JSON fields:
+- "baseline_signals": the original floor-check thoughts. These map to baseline_checks with
+  reject_if_missing: true — but ONLY if no recruiter parameter has contradicted them.
+- "p0_signals": HM excitement signals. These map to p0_weights.
+- "red_flags": HR risk patterns with "flag" and "risk_type".
+- "role_context": org stage, seniority, archetype.
 
-RECRUITER EXTRA PARAMETERS (accumulated across all iterations):
+RECRUITER PARAMETERS — ALL ITERATIONS (every include and exclude added so far):
 {{EXTRA_PARAMS_HISTORY}}
 
-HIRING MANAGER MANUAL CANDIDATE FEEDBACK:
+CANDIDATE FEEDBACK — ALL ITERATIONS (every manual override and disagreement):
 {{CANDIDATE_FEEDBACK_JSON}}
 
-LAST PREVIEW RESULTS (for context — shows what the current criteria produced):
+LAST PREVIEW RESULTS (what the current rubric produced — use to detect misalignment):
 {{PREVIEW_RESULTS_JSON}}
 
-Synthesize all of the above into a single unified rubric. Return this exact JSON:
+---
+
+Before writing the output, run this internal resolution process:
+
+STEP 1 — CONFLICT DETECTION
+For each "include" parameter in RECRUITER PARAMETERS:
+  - Does it RELAX or CONTRADICT any existing baseline_check?
+  - If YES: that check must change. Options in order of severity:
+    (a) Remove the check entirely if the recruiter is saying the dimension doesn't matter
+    (b) Set reject_if_missing: false and rewrite the check as a preference
+    (c) Widen the check text so passing it is easier (e.g. "consumer internet OR adjacent domain")
+  - Never leave a reject_if_missing: true check that contradicts an include parameter.
+    That is a broken rubric.
+
+STEP 2 — EXCLUSION ENCODING
+For each "exclude" parameter:
+  - Add a new red_flag_check or tighten an existing baseline_check.
+  - If it tightens an existing check, rewrite that check — do not add a duplicate.
+
+STEP 3 — FEEDBACK GENERALISATION AND LESSON EXTRACTION
+For each candidate feedback entry (especially disagreements):
+  a) READ THE REASON CAREFULLY. The reason is the recruiter's raw signal about what they
+     actually value vs. what the rubric is currently measuring. This is your highest-quality
+     calibration data.
+
+  b) Ask two questions:
+     1. "What does this reason reveal about a recruiter preference that the current rubric
+        is underweighting or not capturing at all?"
+     2. "What does this reason reveal about a rubric check that is misfiring — passing
+        candidates it shouldn't, or rejecting candidates it shouldn't?"
+
+  c) Derive a LESSON — a generalised principle that applies to ALL candidates, not just
+     the one being reviewed. State it as:
+     "LESSON [N]: When a candidate [observable trait X], they should be [accepted/deprioritized/rejected]
+     because the recruiter values [underlying principle Y]."
+
+  d) Encode the lesson in the rubric:
+     - If the lesson reveals an underweighted signal → increase the corresponding p0_weight
+       OR add a new p0_weight entry if this dimension isn't tracked yet.
+     - If the lesson reveals a misfiring check → rewrite the check text to close the gap,
+       or add FAILS edge cases to make it more precise.
+     - If the lesson reveals a new disqualifying pattern → add a red_flag_check.
+     - If the lesson reveals the recruiter values something not in the rubric at all →
+       add it as a new baseline_check (if it's a floor requirement) or p0_weight (if it's a differentiator).
+
+  e) Do not just reference the specific candidate in the rubric — derive a rule that
+     applies to the entire candidate pool. The rubric should improve even if that
+     candidate is never seen again.
+
+STEP 4 — FULL CONSISTENCY CHECK
+Review the final rubric against every include parameter.
+Check ALL THREE of these, not just baselines:
+(a) No baseline_check with reject_if_missing: true penalises what the include explicitly permits.
+(b) No red_flag_check penalises or deprioritises candidates on the same dimension the include relaxed.
+    Example: if "include candidates without consumer internet experience" was added, then any red flag
+    that says "no consumer-facing products" or "not specifying consumer products" must be REMOVED —
+    it directly punishes what the recruiter said was acceptable.
+(c) The final_evaluation_prompt's HARD FILTERS section does not list anything the include removed.
+If any of (a), (b), or (c) fail, fix the rubric before returning output.
+
+---
+
+Return this exact JSON:
+
 
 {
   "final_evaluation_prompt": "",
@@ -561,28 +762,92 @@ Synthesize all of the above into a single unified rubric. Return this exact JSON
     ]
   },
   "screening_summary": "",
-  "synthesis_notes": ""
+  "synthesis_notes": "",
+  "lessons_learned": [
+    {
+      "candidate": "",
+      "action": "",
+      "reason_given": "",
+      "lesson": "",
+      "rubric_change": ""
+    }
+  ]
 }
 
 Rules:
-1. final_evaluation_prompt: comprehensive LLM instruction combining ALL
-   base criteria AND explicitly listing every single recruiter extra parameter.
-   These parameters MUST be prominently highlighted as mandatory instructions
-   for the grading model to follow!
-2. required_resume_fields: ONLY fields actually needed from: name, education,
-   work_experience, skills, certifications, projects, publications, github_url,
-   total_experience_years, career_gaps_months.
+1. final_evaluation_prompt: a complete, self-contained LLM instruction. Structure:
+   a) Role header: role title, seniority, org_stage, one_liner
+   b) HARD FILTERS (numbered): only baseline_checks where reject_if_missing is STILL true
+      after conflict resolution. Any check relaxed by a recruiter include must NOT appear here.
+   c) WHAT COUNTS — after each hard filter, one sentence stating what resume text definitively
+      passes it. Must reflect the CURRENT rubric after includes/excludes — not the original JD.
+      E.g. "FILTER 1 PASSES if: work_experience contains an explicitly owned product shipped
+      to real users, with named outcomes or user count."
+   d) WHAT DOES NOT COUNT — after WHAT COUNTS, one sentence per filter naming edge cases
+      that do NOT satisfy the filter despite looking plausible. Must reflect current rubric state.
+      Any dimension that has been relaxed by an include must NOT appear here as a disqualifier.
+      E.g. "FILTER 1 FAILS for: internships only; 'PM' title but deliverables are QA/test plans;
+      'launched' meaning internal tool with no external users."
+   e) SCORING SIGNALS: p0_weights with their numeric weights
+   f) SCORING CALIBRATION (3 anchor points derived from the current p0 signals and weights):
+      P0 score 80–100: [role-specific description of what top looks like given current p0 signals]
+      P0 score 50–79: [role-specific description of what mid looks like]
+      P0 score below 50: [role-specific description of what weak looks like]
+      These must be updated whenever p0 weights change from prior iterations.
+   g) RED FLAGS: red_flag_checks (deprioritise, not auto-reject)
+   h) RECRUITER OVERRIDES (this section is mandatory if any include/exclude exists):
+      List each include/exclude verbatim, then state exactly how it changed the rubric:
+      "INCLUDE: [text] → [original check X] is NO LONGER a hard filter / has been widened to Y"
+      "EXCLUDE: [text] → new hard filter added: Z"
+   i) FEEDBACK-DERIVED RULES (mandatory if any feedback exists):
+      For each lesson in lessons_learned, include one line:
+      "LESSON [N]: [lesson text from lessons_learned]. Applied: [rubric_change summary]."
+      These lessons teach the grading model what the recruiter actually values beyond the
+      baseline filters. They must be specific enough that the grading model would score
+      two similar resumes differently based on the lesson.
+   The grading model reads ONLY this prompt. A constraint not stated here will not be applied.
+
+2. required_resume_fields: only fields referenced by at least one active check. Always include "name".
+
 3. p0_weights must sum to 100.
-4. Each "include" extra parameter MUST become either a new mandatory baseline_check,
-   an increase in p0_weight, or a MODIFICATION to an existing baseline_check to make 
-   it broader/relaxed (e.g. changing "MBA required" to "MBA or equivalent required").
-5. Each "exclude" extra parameter MUST become a new red_flag_check, a
-   tighter mandatory baseline_check, or a MODIFICATION to remove an existing lenient 
-   criteria. You CANNOT ignore them.
-6. screening_summary: 2 sentences plain English for a non-technical recruiter.
-7. synthesis_notes: 2-3 sentences explicitly listing exactly which include/exclude 
-   parameters were added to the strict rubric constraints in this iteration.
-8. If CANDIDATE_FEEDBACK_JSON is provided, you MUST analyze why the manager agreed 
-   or disagreed with a candidate's score, and formulate a new baseline_check, p0_weight, 
-   or red_flag_check to guarantee that constraint is strictly enforced moving forward.
+
+4. An "include" that relaxes a dimension:
+   - Set reject_if_missing: FALSE on the conflicting baseline_check (or remove it)
+   - Rewrite the check text to reflect the new, wider standard
+   - Optionally convert it to a p0_weight if the dimension is now a preference not a filter
+   - ALSO: scan all red_flag_checks and remove any that would penalise candidates on that
+     same dimension. An include that relaxes domain X must also remove any red flag that
+     penalises absence of domain X — otherwise the relaxation is cosmetic and the candidate
+     still gets deprioritised. Both the hard filter AND the red flag must be resolved.
+   NEVER leave a check or red flag that penalises what an include explicitly permits.
+
+5. An "exclude" that tightens a constraint:
+   - Add a new red_flag_check or strengthen an existing baseline_check
+   - Rewrite the existing check if the exclude makes it stricter — do not duplicate
+
+6. screening_summary: 2 plain English sentences. Must reflect the CURRENT rubric state
+   after all includes/excludes — not the original JD criteria.
+
+7. synthesis_notes: for each include, exclude, and feedback item — state what it was and
+   exactly what changed in the rubric. Format: "[parameter] → [change made]".
+   If a parameter was already handled in a prior iteration, say "already encoded".
+
+8. For every feedback entry: extract the generalised principle and encode it as a rubric
+   change. Do not reference the specific candidate in the rubric — derive the rule.
+   All prior iteration feedback must remain encoded — do not drop it.
+
+9. lessons_learned: one entry per feedback item (all iterations, not just the latest).
+   - "candidate": the file_name of the candidate from the feedback entry
+   - "action": what the recruiter did ("disagree", "approve", "reject")
+   - "reason_given": the exact reason the recruiter provided — copy it verbatim
+   - "lesson": the generalised recruiter preference derived from that reason. Write it as a
+     complete sentence: "Candidates who [X] should be [deprioritized/prioritized/rejected]
+     because the recruiter values [Y]." This must be actionable and role-agnostic enough
+     to apply to all candidates in this pool.
+   - "rubric_change": what specifically changed in the rubric as a result of this lesson.
+     E.g. "Increased p0 weight for 'shipped to real users' from 25 → 35. Decreased
+     'technical depth' from 25 → 15." or "Added FAILS edge case to baseline check 2:
+     'owned feature but no evidence of external users does not pass'."
+   If a feedback entry has no reason provided, derive the lesson from the action and
+   the candidate's preview scores alone. Do not leave lesson or rubric_change blank.
 """.strip()

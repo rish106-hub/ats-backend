@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from dotenv import load_dotenv
 import os
@@ -26,3 +26,12 @@ def get_db():
 def init_db() -> None:
     from app import models  # noqa: F401 — registers all models
     Base.metadata.create_all(bind=engine)
+    # Additive migrations — safe to run on every startup
+    with engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE resumes ADD COLUMN IF NOT EXISTS resume_lens JSON"
+        ))
+        conn.execute(text(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS candidate_feedback_history JSON"
+        ))
+        conn.commit()

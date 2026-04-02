@@ -25,6 +25,8 @@ from ats_poc.prompts import (
     CALL_2_TEMPLATE,
     CALL_3_SYSTEM,
     CALL_3_TEMPLATE,
+    CALL_LENS_SYSTEM,
+    CALL_LENS_TEMPLATE,
     CALL_PREVIEW_SYSTEM,
     CALL_PREVIEW_TEMPLATE,
     CALL_SYNTHESIZE_SYSTEM,
@@ -32,6 +34,7 @@ from ats_poc.prompts import (
 )
 from ats_poc.resume_parser import parse_resume_pdf
 from ats_poc.sample_selection import (
+    build_scored_resume_payload,
     compress_resume,
     extract_keywords,
     pick_representative_sample,
@@ -41,6 +44,7 @@ router = APIRouter(prefix="/api")
 
 MODEL_NAME = "gemini-2.5-flash-lite"
 PREVIEW_BATCH_SIZE = 2
+LENS_BATCH_SIZE = 6
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -171,11 +175,66 @@ def list_resumes(session_id: str, db: DBSession = Depends(get_db)):
 
 # ── step 3: preview loop ───────────────────────────────────────────────────
 
+def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -> None:
+    """Read each resume's full raw text through the JD lens and store the result.
+
+    Idempotent — only processes resumes where resume_lens is None.
+    Batched in groups of LENS_BATCH_SIZE to keep token payloads manageable.
+    """
+    un_lensed = [
+        r for r in resumes
+        if r.resume_lens is None and (r.quality or {}).get("readable")
+    ]
+    if not un_lensed:
+        return
+
+    jd = row.jd_analysis or {}
+    # Pass gap_questions so the lens knows what JD ambiguities exist even if unanswered
+    gap_context = jd.get("gap_questions", [])
+
+    for i in range(0, len(un_lensed), LENS_BATCH_SIZE):
+        batch = un_lensed[i : i + LENS_BATCH_SIZE]
+        resume_inputs = [
+            {"file_name": r.file_name, "raw_text": r.raw_text or ""}
+            for r in batch
+        ]
+        parsed, _raw, usage, _prompt = run_structured_call(
+            model_name=MODEL_NAME,
+            system_instruction=CALL_LENS_SYSTEM,
+            template=CALL_LENS_TEMPLATE,
+            replacements={
+                "ROLE_TYPE": jd.get("role_type", "unknown"),
+                "ROLE_CONTEXT": jd.get("role_context", {}),
+                "ONE_LINER": jd.get("one_liner", ""),
+                "BASELINE_SIGNALS": jd.get("baseline_signals", []),
+                "P0_SIGNALS": jd.get("p0_signals", []),
+                "GAP_ANSWERS": gap_context,
+                "RESUMES": resume_inputs,
+            },
+        )
+        _accumulate_tokens(row, f"Lens batch {i // LENS_BATCH_SIZE + 1}", usage)
+
+        lens_list = parsed if isinstance(parsed, list) else []
+        lens_by_file = {item["file_name"]: item for item in lens_list if isinstance(item, dict)}
+        for r in batch:
+            lens = lens_by_file.get(r.file_name)
+            if lens:
+                r.resume_lens = lens
+                db.add(r)
+
+    db.flush()
+
+
 def _pick_preview_batch(row: Session, db: DBSession) -> list[dict]:
     """Select PREVIEW_BATCH_SIZE readable resumes not yet shown."""
     all_resumes = db.query(Resume).filter(Resume.session_id == str(row.id)).all()
     readable = [
-        {"file_name": r.file_name, "resume_json": r.resume_json, "quality": r.quality}
+        {
+            "file_name": r.file_name,
+            "resume_json": r.resume_json,
+            "resume_lens": r.resume_lens,
+            "quality": r.quality,
+        }
         for r in all_resumes
         if (r.quality or {}).get("readable")
     ]
@@ -217,8 +276,20 @@ def _run_silent_call2(row: Session) -> dict:
     return parsed
 
 
-def _run_synthesis(row: Session, candidate_feedback: list[dict] = None) -> dict:
-    """Synthesize base criteria + all extra params + human feedback into updated config."""
+def _run_synthesis(row: Session, new_feedback: list[dict] | None = None) -> dict:
+    """Synthesize base criteria + ALL accumulated params + ALL accumulated feedback.
+
+    new_feedback is appended to the session's candidate_feedback_history before
+    synthesis runs, so every call sees the complete feedback record to date.
+    """
+    if new_feedback:
+        history = list(row.candidate_feedback_history or [])
+        for fb in new_feedback:
+            fb_with_iter = dict(fb)
+            fb_with_iter["iteration"] = row.preview_iteration_count
+            history.append(fb_with_iter)
+        row.candidate_feedback_history = history
+
     parsed, _raw, usage, _prompt = run_structured_call(
         model_name=MODEL_NAME,
         system_instruction=CALL_SYNTHESIZE_SYSTEM,
@@ -226,7 +297,7 @@ def _run_synthesis(row: Session, candidate_feedback: list[dict] = None) -> dict:
         replacements={
             "BASE_CRITERIA_JSON": row.base_criteria or {},
             "EXTRA_PARAMS_HISTORY": row.extra_params_history or [],
-            "CANDIDATE_FEEDBACK_JSON": candidate_feedback or [],
+            "CANDIDATE_FEEDBACK_JSON": row.candidate_feedback_history or [],
             "PREVIEW_RESULTS_JSON": row.preview_field_results or {},
         },
     )
@@ -235,23 +306,28 @@ def _run_synthesis(row: Session, candidate_feedback: list[dict] = None) -> dict:
     return parsed
 
 def _run_preview_scoring(row: Session, batch: list[dict]) -> dict:
-    """Run field-level scoring on the selected batch with JD-aware compression."""
+    """Run field-level scoring on the selected batch using lens + verifiable facts."""
     criteria = row.synthesized_config or row.base_criteria or {}
     required_fields = criteria.get("required_resume_fields", [])
-    
-    resume_jsons = []
+
+    payloads = []
     for r in batch:
-        rj = compress_resume(r["resume_json"], required_fields)
-        if not rj.get("name"):
-            rj["name"] = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
-        resume_jsons.append(rj)
+        payload = build_scored_resume_payload(
+            r["resume_json"],
+            r.get("resume_lens"),
+            required_fields,
+        )
+        if not payload.get("name"):
+            payload["name"] = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
+        payloads.append(payload)
+
     parsed, _raw, usage, _prompt = run_structured_call(
         model_name=MODEL_NAME,
         system_instruction=CALL_PREVIEW_SYSTEM,
         template=CALL_PREVIEW_TEMPLATE,
         replacements={
             "CRITERIA_JSON": criteria,
-            "RESUME_JSON_ARRAY": resume_jsons,
+            "RESUME_JSON_ARRAY": payloads,
         },
     )
     _accumulate_tokens(row, "Preview Score", usage)
@@ -265,6 +341,8 @@ def start_preview(session_id: str, body: StartPreviewRequest, db: DBSession = De
     configure_genai(api_key=_resolve_key(body.api_key))
 
     if row.synthesized_config is None:
+        all_resumes = db.query(Resume).filter(Resume.session_id == str(row.id)).all()
+        _run_resume_enrichment(row, all_resumes, db)
         _run_silent_call2(row)
 
     batch = _pick_preview_batch(row, db)
@@ -362,8 +440,19 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
     if not readable:
         raise HTTPException(status_code=400, detail="No readable resumes to assess.")
 
+    # Enrich any resumes that haven't been lensed yet (e.g. never appeared in a preview batch)
+    _run_resume_enrichment(row, readable, db)
+
     required_fields = config.get("required_resume_fields", []) if config else []
-    resume_dicts = [{"file_name": r.file_name, "resume_json": r.resume_json, "quality": r.quality} for r in readable]
+    resume_dicts = [
+        {
+            "file_name": r.file_name,
+            "resume_json": r.resume_json,
+            "resume_lens": r.resume_lens,
+            "quality": r.quality,
+        }
+        for r in readable
+    ]
 
     if len(resume_dicts) <= 15:
         batch = resume_dicts
@@ -371,15 +460,14 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
         keywords = extract_keywords(row.jd_text or "", row.base_criteria or {}, config or {})
         batch = pick_representative_sample(resume_dicts, keywords, sample_size=15)
 
-    # Always include name so Gemini can identify candidates; fall back to filename
-    compressed = []
+    # Build scored payloads — lens + verifiable facts; fall back to name from filename
+    scored_payloads = []
     for r in batch:
-        c = compress_resume(r["resume_json"], required_fields)
-        parsed_name = r["resume_json"].get("name", "")
-        if not parsed_name:
-            parsed_name = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
-        c["name"] = parsed_name
-        compressed.append(c)
+        payload = build_scored_resume_payload(r["resume_json"], r.get("resume_lens"), required_fields)
+        if not payload.get("name"):
+            payload["name"] = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
+        scored_payloads.append(payload)
+
     rubric = config.get("scoring_rubric", {}) if config else {}
     prompt_text = config.get("final_evaluation_prompt", "") if config else ""
 
@@ -390,7 +478,7 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
         replacements={
             "FINAL_EVALUATION_PROMPT": prompt_text,
             "SCORING_RUBRIC_JSON": rubric,
-            "ARRAY_OF_15_COMPRESSED_RESUMES": compressed,
+            "ARRAY_OF_15_COMPRESSED_RESUMES": scored_payloads,
         },
     )
     _accumulate_tokens(row, "Call 3", usage)

@@ -20,6 +20,7 @@ class Session(Base):
     status = Column(String(50), default="created")
     preview_iteration_count = Column(Integer, default=0)
     extra_params_history = Column(JSON, default=list)
+    candidate_feedback_history = Column(JSON, default=list)
     preview_field_results = Column(JSON, nullable=True)
     preview_seen_files = Column(JSON, default=list)
     full_results = Column(JSON, nullable=True)
@@ -36,6 +37,7 @@ class Resume(Base):
     raw_text = Column(Text)
     quality = Column(JSON)
     keyword_score = Column(Float, default=0.0)
+    resume_lens = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

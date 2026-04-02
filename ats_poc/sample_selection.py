@@ -108,6 +108,46 @@ def compress_resume(resume_json: dict[str, Any], required_fields: list[str]) -> 
     return compressed
 
 
+# Fields that carry hard verifiable facts — always included alongside the lens
+# so the scoring model can check thresholds without re-interpreting raw descriptions.
+_VERIFIABLE_FACT_FIELDS = {"total_experience_years", "career_gaps_months", "education", "github_url"}
+
+
+def build_scored_resume_payload(
+    resume_json: dict[str, Any],
+    resume_lens: dict[str, Any] | None,
+    required_fields: list[str],
+) -> dict[str, Any]:
+    """Build the payload sent to scoring calls (CALL_PREVIEW / CALL_3).
+
+    Layer 1 — lens (interpretive): recruiter's narrative notes per dimension.
+    Layer 2 — verifiable facts: raw threshold fields the rubric references.
+
+    Falls back to compress_resume() if no lens is available.
+    """
+    name = resume_json.get("name", "")
+    payload: dict[str, Any] = {"name": name}
+
+    if resume_lens is None:
+        # No lens yet — fall back to old compressed format so scoring still works
+        payload.update(compress_resume(resume_json, required_fields))
+        return payload
+
+    # Drop internal file_name key from lens before sending to scoring model
+    payload["lens"] = {k: v for k, v in resume_lens.items() if k != "file_name"}
+
+    # Append verifiable raw fact fields referenced by the rubric
+    for field in required_fields:
+        if field in _VERIFIABLE_FACT_FIELDS and field in resume_json:
+            value = resume_json[field]
+            if field == "education" and isinstance(value, list):
+                payload[field] = value[:3]
+            else:
+                payload[field] = value
+
+    return payload
+
+
 def pick_representative_sample(
     parsed_resumes: list[dict[str, Any]],
     keywords: list[str],
