@@ -34,4 +34,7 @@ def init_db() -> None:
         conn.execute(text(
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS candidate_feedback_history JSON"
         ))
+        conn.execute(text(
+            "ALTER TABLE resumes ADD COLUMN IF NOT EXISTS pdf_bytes BYTEA"
+        ))
         conn.commit()

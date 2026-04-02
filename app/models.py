@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, String, Integer, Text, DateTime, JSON, Float
+from sqlalchemy import Column, String, Integer, Text, DateTime, JSON, Float, LargeBinary
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
@@ -38,6 +38,7 @@ class Resume(Base):
     quality = Column(JSON)
     keyword_score = Column(Float, default=0.0)
     resume_lens = Column(JSON, nullable=True)
+    pdf_bytes = Column(LargeBinary, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

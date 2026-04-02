@@ -5,6 +5,7 @@ import os
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.orm import Session as DBSession
 
 from app.database import get_db
@@ -13,6 +14,7 @@ from app.schemas import (
     AcceptRequest,
     AnalyzeJDRequest,
     RefineRequest,
+    ResumeDetailOut,
     ResumeOut,
     SessionOut,
     StartPreviewRequest,
@@ -158,6 +160,7 @@ async def upload_resumes(
             resume_json=parsed.get("resume_json", {}),
             raw_text=parsed.get("raw_text", ""),
             quality=parsed.get("quality", {}),
+            pdf_bytes=pdf_bytes,
         )
         db.add(resume_row)
 
@@ -173,7 +176,62 @@ def list_resumes(session_id: str, db: DBSession = Depends(get_db)):
     return db.query(Resume).filter(Resume.session_id == session_id).all()
 
 
+@router.get("/sessions/{session_id}/resumes/{file_name:path}/pdf")
+def get_resume_pdf(session_id: str, file_name: str, db: DBSession = Depends(get_db)):
+    resume = (
+        db.query(Resume)
+        .filter(Resume.session_id == session_id, Resume.file_name == file_name)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    if not resume.pdf_bytes:
+        raise HTTPException(status_code=404, detail="PDF not stored for this resume")
+    return Response(
+        content=resume.pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{file_name}"'},
+    )
+
+
+@router.get("/sessions/{session_id}/resumes/{file_name:path}", response_model=ResumeDetailOut)
+def get_resume_detail(session_id: str, file_name: str, db: DBSession = Depends(get_db)):
+    resume = (
+        db.query(Resume)
+        .filter(Resume.session_id == session_id, Resume.file_name == file_name)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    return resume
+
+
 # ── step 3: preview loop ───────────────────────────────────────────────────
+
+_LENS_REQUIRED_FIELDS = {
+    "ownership_arc", "domain_proximity", "craft_signals",
+    "experience_profile", "trajectory", "hm_flag", "red_flag_notes",
+}
+_LENS_FILLER_VALUES = {
+    "not applicable", "n/a", "none", "", "no information",
+    "not available", "not provided", "not stated",
+}
+_LENS_MIN_CHARS = 10
+
+
+def _validate_lens(lens: dict) -> bool:
+    """Return True only if every required lens field is populated with non-filler content."""
+    if not isinstance(lens, dict):
+        return False
+    for field in _LENS_REQUIRED_FIELDS:
+        val = lens.get(field, "")
+        if not isinstance(val, str):
+            return False
+        stripped = val.strip().lower()
+        if stripped in _LENS_FILLER_VALUES or len(stripped) < _LENS_MIN_CHARS:
+            return False
+    return True
+
 
 def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -> None:
     """Read each resume's full raw text through the JD lens and store the result.
@@ -194,10 +252,13 @@ def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -
 
     for i in range(0, len(un_lensed), LENS_BATCH_SIZE):
         batch = un_lensed[i : i + LENS_BATCH_SIZE]
-        resume_inputs = [
-            {"file_name": r.file_name, "raw_text": r.raw_text or ""}
+        # Wrap each resume in sentinel delimiters so the model cannot blend candidates.
+        resume_blocks = [
+            f"=== CANDIDATE START: {r.file_name} ===\n{r.raw_text or ''}\n=== CANDIDATE END: {r.file_name} ==="
             for r in batch
         ]
+        resume_inputs_str = "\n\n".join(resume_blocks)
+
         parsed, _raw, usage, _prompt = run_structured_call(
             model_name=MODEL_NAME,
             system_instruction=CALL_LENS_SYSTEM,
@@ -209,18 +270,37 @@ def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -
                 "BASELINE_SIGNALS": jd.get("baseline_signals", []),
                 "P0_SIGNALS": jd.get("p0_signals", []),
                 "GAP_ANSWERS": gap_context,
-                "RESUMES": resume_inputs,
+                "RESUMES": resume_inputs_str,
             },
         )
-        _accumulate_tokens(row, f"Lens batch {i // LENS_BATCH_SIZE + 1}", usage)
+        _accumulate_tokens(row, f"Lens {i + 1}", usage)
 
         lens_list = parsed if isinstance(parsed, list) else []
+
+        # Warn if Gemini returned fewer entries than we sent — those resumes fall back to compress_resume.
+        returned_names = {
+            item.get("file_name", "") for item in lens_list if isinstance(item, dict)
+        }
+        dropped = [r.file_name for r in batch if r.file_name not in returned_names]
+        if dropped:
+            print(
+                f"[LENS DROP WARNING] Sent {len(batch)} resume(s), received {len(lens_list)}. "
+                f"Dropped (will use compress_resume fallback): {dropped}"
+            )
+
         lens_by_file = {item["file_name"]: item for item in lens_list if isinstance(item, dict)}
         for r in batch:
             lens = lens_by_file.get(r.file_name)
             if lens:
-                r.resume_lens = lens
-                db.add(r)
+                if _validate_lens(lens):
+                    r.resume_lens = lens
+                else:
+                    print(
+                        f"[LENS VALIDATION FAILED] {r.file_name} — one or more fields are empty "
+                        f"or filler. Storing None; scoring will fall back to compress_resume()."
+                    )
+                    r.resume_lens = None
+            db.add(r)
 
     db.flush()
 

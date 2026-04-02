@@ -32,6 +32,7 @@ class ResumeOut(BaseModel):
     resume_json: Any
     quality: Any
     keyword_score: float
+    resume_lens: Optional[Any] = None
 
     model_config = {"from_attributes": True}
 
@@ -59,3 +60,12 @@ class RefineRequest(BaseModel):
 
 class AcceptRequest(BaseModel):
     api_key: Optional[str] = None
+
+
+class ResumeDetailOut(BaseModel):
+    file_name: str
+    raw_text: Optional[str]
+    resume_json: Any
+    resume_lens: Any
+
+    model_config = {"from_attributes": True}

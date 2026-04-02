@@ -295,17 +295,34 @@ def parse_education(section_lines: list[str]) -> list[dict[str, str]]:
     return degrees[:6]
 
 
-def infer_total_experience_years(text: str, work_experience: list[dict[str, Any]]) -> float:
-    explicit_match = re.search(
-        r"(\d+(?:\.\d+)?)\+?\s+years?\s+(?:of\s+)?experience",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if explicit_match:
-        return round(float(explicit_match.group(1)), 1)
+# Lines containing these tokens are JD requirement context, not candidate self-description.
+_JD_REQUIREMENT_MARKERS = re.compile(
+    r"\b(required|requirements|minimum|preferred|ideal\s+candidate|"
+    r"we\s+are\s+looking|must\s+have|you\s+should\s+have|responsibilities)\b",
+    flags=re.IGNORECASE,
+)
 
+
+def infer_total_experience_years(text: str, work_experience: list[dict[str, Any]]) -> float:
+    # Primary: sum of parsed date-range durations — grounded in explicit dates, not self-reported claims.
     total_months = sum(item.get("duration_months", 0) for item in work_experience)
-    return round(total_months / 12, 1) if total_months else 0.0
+    if total_months > 0:
+        return round(total_months / 12, 1)
+
+    # Fallback: scan text line-by-line, skipping lines that look like JD requirement text
+    # so we don't fire on "Requirements: 5+ years of experience" embedded in the resume.
+    for line in text.splitlines():
+        if _JD_REQUIREMENT_MARKERS.search(line):
+            continue
+        m = re.search(
+            r"(\d+(?:\.\d+)?)\+?\s+years?\s+(?:of\s+)?experience",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return round(float(m.group(1)), 1)
+
+    return 0.0
 
 
 def infer_career_gaps_months(ranges: list[tuple[tuple[int, int], tuple[int, int]]]) -> list[int]:

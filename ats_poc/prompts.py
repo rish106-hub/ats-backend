@@ -9,20 +9,23 @@ CALL_1_SYSTEM = (
     "A BASELINE SIGNAL is the recruiter's floor check: the thought that runs through their head "
     "as they skim a resume and decide whether to keep reading. Baseline signals are about "
     "whether the person has actually DONE the work this role demands — not whether they list "
-    "the right keywords. They ask: Is this experience real and professional or academic and "
+    "the right keywords. They evaluate: Is this experience real and professional or academic and "
     "superficial? Is their background relevant to this specific problem space? Does the depth "
     "of their work match what this role will require from day one? "
-    "Phrase baseline signals as evaluative thoughts: 'Has this person actually...', "
-    "'Do they have evidence of...', 'Is their background...', 'Does the work show...' "
+    "Phrase baseline signals as declarative evaluative statements — what must be TRUE about "
+    "the candidate for them to pass: 'Background shows...', 'Experience demonstrates...', "
+    "'Career history reflects...', 'Work shows evidence of...', 'Has shipped / owned / built...' "
+    "Do NOT phrase as questions. Write each signal as a confident statement of what is required. "
     "\n\n"
     "A P0 SIGNAL is the hiring manager's excitement trigger: the thought that makes them "
     "put a resume at the top of the pile. P0 signals are about ownership, impact, trajectory, "
-    "and problem-match beyond the baseline. They ask: Have they owned something end-to-end, "
-    "not just contributed? Is there a moment in their career where they clearly leveled up? "
-    "Have they solved a problem genuinely similar to ours? Does their trajectory show someone "
-    "who is getting harder to find, not easier? "
-    "Phrase P0 signals as excited HM thoughts: 'Have they owned...', 'Is there a point in "
-    "their career...', 'Does their background show...', 'Would their experience mean...' "
+    "and problem-match beyond the baseline. They look for: end-to-end ownership not just "
+    "contribution, a clear career inflection point, a problem genuinely similar to theirs, "
+    "a trajectory that shows someone getting harder to find, not easier. "
+    "Phrase P0 signals as declarative statements of what distinguishes a top candidate: "
+    "'Has owned...', 'Career shows a clear inflection point where...', "
+    "'Background demonstrates...', 'Track record reflects...' "
+    "Do NOT phrase as questions. Write each signal as a clear statement of what exceptional looks like. "
     "\n\n"
     "SIGNAL QUALITY RULES: "
     "Every signal must be derived strictly from what the JD demands — work to be done, "
@@ -64,12 +67,11 @@ CALL_1_SYSTEM = (
     "really the same underlying concern approached from different angles? If so, collapse them "
     "into one proxy signal that names the combination of observable facts that answers all of "
     "them simultaneously. "
-    "A proxy signal is COMBINATORIAL, not additive. Instead of asking separately about "
-    "professional legitimacy, domain fit, and work depth — combine them: 'Has this person "
-    "spent time in a company where product work was core to the business (not a side team), "
-    "in a role that was actually theirs to own, long enough to see the consequences of their "
-    "decisions? That combination tells me professional context, real ownership, and relevant "
-    "depth all at once.' "
+    "A proxy signal is COMBINATORIAL, not additive. Instead of writing separately about "
+    "professional legitimacy, domain fit, and work depth — combine them: 'Has spent time "
+    "at a company where product work was core to the business (not a side team), in a role "
+    "that was actually theirs to own, long enough to see the consequences of their decisions. "
+    "That combination reflects professional context, real ownership, and relevant depth at once.' "
     "Proxy patterns to look for: "
     "COMPANY TYPE + ROLE TITLE + TENURE: Time at a relevant company, at the right level, "
     "for the right duration is a three-in-one proxy for domain fit, professional legitimacy, "
@@ -197,50 +199,50 @@ Rules:
           not a contributor to someone else's architecture, but the person responsible
           when things broke and accountable for making them better."
 
-2. baseline_signals: 3 to 6 strings. Each is a recruiter's internal floor-check thought.
+2. baseline_signals: 3 to 6 strings. Each is a declarative statement of what must be true
+   about the candidate for them to clear the floor.
    - MUST be about WORK DONE, not skills listed
-   - MUST be phrased as an evaluative thought — not a requirement, a question about evidence:
-     "Has this person...", "Do they have evidence of...", "Is their experience...",
-     "Does their background show...", "Does the work show..."
+   - MUST be phrased as a declarative statement — not a question, not a requirement list:
+     "Background shows...", "Career history demonstrates...", "Work shows evidence of...",
+     "Has shipped / owned / built...", "Experience reflects..."
    - MUST be specific to THIS JD — not a generic statement applicable to any role
    - MUST collectively cover all four completeness dimensions (from COMPLETENESS RULE):
      experience threshold, technical/craft competency, domain specificity, deliverable evidence
    - PREFER PROXY SIGNALS: where multiple dimensions can be answered by a single observable
-     combination of facts, write one proxy signal instead of multiple separate questions.
-     Proxy signal format: "Has this person spent [duration] at a [company type] in a [role type]
-     where [output type] was their direct responsibility — because that combination tells me
-     [professional legitimacy] + [domain fit] + [craft evidence] at once?"
+     combination of facts, write one proxy signal instead of multiple separate statements.
+     Proxy signal format: "Has spent [duration] at a [company type] in a [role type] where
+     [output type] was their direct responsibility — covering [professional legitimacy] +
+     [domain fit] + [craft evidence] in one signal."
      Other proxy patterns: title progression at one employer, startup stage + scope,
      output type + domain track record.
    Bad: "Candidate must have React experience"
    Bad: "4+ years of backend experience required"
-   Bad: Three separate signals asking about "professional experience", "consumer domain",
+   Bad: Three separate signals covering "professional experience", "consumer domain",
         and "PM craft" when a single proxy covers all three.
-   Good: "Has this person actually shipped React applications to production with real
-          users — not just tutorial projects — and is there work they owned, not just
-          a team output they were part of?"
-   Good: "Have they spent at least a year as an actual PM — not a PM intern, not a
-          'growth analyst who did some PM work' — at a company where a real product
-          with real users was their responsibility? That combination of role, context,
-          and duration tells me professional legitimacy, domain relevance, and real
-          ownership all at once."
+   Good: "Has shipped React applications to production with real users — owned output,
+          not just a team contribution to someone else's codebase."
+   Good: "Has spent at least a year as an actual PM — not an intern, not a growth
+          analyst doing incidental PM work — at a company where a real product with
+          real users was their direct responsibility. That combination of role, context,
+          and duration reflects professional legitimacy, domain relevance, and real
+          ownership at once."
 
-3. p0_signals: 3 to 5 strings. Each is an HM's excitement trigger.
+3. p0_signals: 3 to 5 strings. Each is a declarative statement of what makes a candidate
+   exceptional — the HM's excitement signal written as a clear criterion.
    - MUST be about ownership, impact, trajectory, or problem-match BEYOND the baseline
-   - MUST be phrased as an excited HM thought:
-     "Have they owned...", "Is there a point in their career where...",
-     "Does their background show...", "Would this person have..."
-   - MUST ask about the BEYOND — what genuinely separates top 10% from merely competent
+   - MUST be phrased as a declarative statement of what exceptional looks like:
+     "Has owned...", "Career shows a clear inflection point where...",
+     "Background demonstrates...", "Track record reflects...", "Has built/shipped/led..."
+   - MUST describe the BEYOND — what genuinely separates top 10% from merely competent
    - MUST be specific to what THIS JD actually implies is exceptional
    Bad: "Experience with system design"
    Bad: "Leadership experience is a plus"
-   Good: "Have they designed a system from scratch and owned it through production —
-          not implemented someone else's design, but made the architectural decisions,
-          absorbed the failures, and improved it over time based on real operational
-          learnings?"
-   Good: "Is there a clear inflection point in their career where they went from
-          executing work to shaping what work gets done — a point where their scope
-          of impact grew beyond their own immediate output?"
+   Good: "Has designed a system from scratch and owned it through production —
+          made the architectural decisions, absorbed the failures, and improved it
+          based on real operational learnings. Not an implementer of someone else's design."
+   Good: "Career shows a clear inflection point where scope grew from executing work
+          to shaping what work gets done — a moment where their impact expanded
+          beyond their own immediate output."
 
 4. red_flags: max 5. HR-lens risk patterns detectable from a resume. Not assumptions
    about the person — observable patterns in how the resume is written or structured.
@@ -432,6 +434,21 @@ CALL_LENS_SYSTEM = (
     "the downstream scoring model to re-read the raw text — so they must be accurate, "
     "specific, and capture anything that would matter to a recruiter or hiring manager. "
     "Never write generic filler. If a dimension is absent from the resume, say so explicitly. "
+    "\n\n"
+    "GROUNDING RULE — NON-NEGOTIABLE: "
+    "Every specific claim you write must be directly supported by text that appears verbatim "
+    "or near-verbatim in the resume you are currently reading. This means: "
+    "(1) Do not invent or round up metrics. If the resume says 'improved conversion rate' "
+    "with no figure, write 'improved conversion rate — no metric stated'. "
+    "Do not write '30% improvement' or any number not present in the text. "
+    "(2) Do not infer company type, scale, or funding stage unless the resume explicitly states it. "
+    "If ambiguous, write 'company type not stated in resume'. "
+    "(3) Do not extrapolate tenure or dates. Use only the date ranges written in the resume. "
+    "If absent, write 'tenure not stated'. "
+    "(4) Do not blend information across candidates. Every observation must be traceable "
+    "to the specific resume delimited by the CANDIDATE START/END markers you are currently reading. "
+    "If you are uncertain whether a detail came from this resume or another, do not include it. "
+    "\n\n"
     "Return ONLY valid JSON array. No markdown. No preamble."
 )
 
@@ -453,32 +470,38 @@ e.g. if a cloud platform was clarified as "AWS required", note AWS-specific evid
 its absence in craft_signals):
 {{GAP_ANSWERS}}
 
-Read each resume below through this specific role lens.
+Each resume below is wrapped in === CANDIDATE START === and === CANDIDATE END === delimiters.
+Read each resume STRICTLY within its own delimiters. Do not let details from one candidate's
+section influence your notes for another. Every observation you write must be traceable to
+the specific resume currently bounded by those markers.
 
 RESUMES:
 {{RESUMES}}
 
-Return this exact JSON (array, one object per resume, in the same order as input):
+Return this exact JSON (array, one object per resume):
 
 [
   {
     "file_name": "",
-    "ownership_arc": "Career ownership narrative — what they owned vs. contributed to, at which companies, in which roles, for how long. Name specific companies and roles.",
-    "domain_proximity": "How close is their background to this role's domain — consumer/B2B, startup/enterprise, vertical, scale. Be explicit about gaps.",
-    "craft_signals": "Specific deliverables, artifacts, or outputs produced in prior roles that are relevant to what this role demands. State what is absent if not found.",
-    "experience_profile": "Nature of the experience — professional vs. academic, product-first vs. service company, tenure pattern. Total years and quality of those years.",
-    "trajectory": "Growth pattern — promotions, scope expansion, stagnation. Is this person becoming harder to find or easier?",
-    "hm_flag": "The one thing an HM would want to probe in an interview, or the one gap that could disqualify. Be honest and specific — not diplomatic. If no concern, say so.",
-    "red_flag_notes": "Observable HR-lens patterns: passive ownership language, short tenures without reason, domain mismatch, academic-only work. Write 'None' if clean."
+    "ownership_arc": "Career ownership narrative — what they owned vs. contributed to, at which companies, in which roles, for how long. Quote or closely paraphrase what is written. Do not invent role scope or tenure.",
+    "domain_proximity": "How close is their background to this role's domain — consumer/B2B, startup/enterprise, vertical, scale. Only state what the resume explicitly says. If company type is not stated, write 'company type not stated in resume'.",
+    "craft_signals": "Specific deliverables, artifacts, or outputs named in the resume that are relevant to what this role demands. Quote the resume's own language — do not add metrics not present. State what is absent if not found.",
+    "experience_profile": "Nature of the experience — professional vs. academic, product-first vs. service company, tenure pattern. Use only dates and titles written in the resume. Do not extrapolate.",
+    "trajectory": "Growth pattern — promotions, scope expansion, stagnation. Derive only from explicit title changes, date ranges, and responsibilities stated in the resume.",
+    "hm_flag": "The one thing an HM would want to probe in an interview, or the one gap that could disqualify. Be honest and specific — not diplomatic. If no concern, say so. Must be based on what is written or clearly absent.",
+    "red_flag_notes": "Observable HR-lens patterns: passive ownership language, short tenures without reason, domain mismatch, academic-only work. Write 'None' if clean. Must be grounded in the resume text."
   }
 ]
 
 Rules:
-1. Each field must be a specific factual observation — not 'strong background' but 'X years at Y doing Z'
+1. Each field must quote or closely paraphrase what is written in the resume — not 'strong background'
+   but 'X years at Y doing Z as stated in the resume'. Do not invent metrics, company attributes,
+   or time periods not present in the source text.
 2. If a dimension is not present in the resume, state it explicitly: 'No mention of PRD writing anywhere in this resume'
 3. hm_flag must be honest. If no concern exists, write 'No obvious flag — strong fit across baseline dimensions'. Do not fabricate concerns.
 4. Keep each field under 60 words. Dense and specific, not padded.
-5. file_name must match exactly the file_name you received in the RESUMES input.
+5. file_name must exactly match the identifier in the === CANDIDATE START === line for this resume. Do not swap, transpose, or invent file names.
+6. GROUNDING SELF-CHECK: Before writing each field, ask yourself — "Can I point to the exact line in this candidate's resume that supports this claim?" If yes, write it. If no, either state the absence explicitly ("No mention of X in this resume") or write "not stated in resume". Never extrapolate a metric, company attribute, or tenure that is not written in the text.
 """.strip()
 
 CALL_3_SYSTEM = (
