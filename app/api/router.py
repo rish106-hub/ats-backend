@@ -216,7 +216,7 @@ _LENS_FILLER_VALUES = {
     "not applicable", "n/a", "none", "", "no information",
     "not available", "not provided", "not stated",
 }
-_LENS_MIN_CHARS = 10
+_LENS_MIN_CHARS = 30
 
 
 def _validate_lens(lens: dict) -> bool:
@@ -294,12 +294,16 @@ def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -
             if lens:
                 if _validate_lens(lens):
                     r.resume_lens = lens
+                    print(f"[LENS SUCCESS] {r.file_name} — lens validated and stored")
                 else:
                     print(
                         f"[LENS VALIDATION FAILED] {r.file_name} — one or more fields are empty "
                         f"or filler. Storing None; scoring will fall back to compress_resume()."
                     )
                     r.resume_lens = None
+            else:
+                print(f"[LENS DROP] {r.file_name} — not returned by model. Scoring will fall back to compress_resume().")
+                r.resume_lens = None
             db.add(r)
 
     db.flush()

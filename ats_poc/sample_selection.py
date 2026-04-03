@@ -85,26 +85,73 @@ def score_resume_against_keywords(resume_json: dict[str, Any], keywords: list[st
 
 
 def compress_resume(resume_json: dict[str, Any], required_fields: list[str]) -> dict[str, Any]:
+    """Compress resume while preserving qualitative signals for fallback scoring."""
     compressed = {}
+    
+    # Always include basic identification
+    compressed["name"] = resume_json.get("name", "")
+    
+    # Include verifiable facts for threshold checking
+    for field in _VERIFIABLE_FACT_FIELDS:
+        if field in resume_json:
+            value = resume_json[field]
+            if field == "education" and isinstance(value, list):
+                compressed[field] = value[:3]
+            else:
+                compressed[field] = value
+    
+    # Process required fields with enhanced qualitative preservation
     for field in required_fields:
-        value = resume_json.get(field)
-        if field == "work_experience" and isinstance(value, list):
-            compressed[field] = [
-                {
+        if field == "work_experience" and isinstance(resume_json.get(field), list):
+            work_items = []
+            for item in resume_json[field][:5]:
+                work_item = {
                     "company": item.get("company", ""),
                     "role": item.get("role", ""),
                     "duration_months": item.get("duration_months", 0),
                     "type": item.get("type", ""),
-                    "description": item.get("description", "")[:240],
+                    # Preserve more description for qualitative analysis
+                    "description": item.get("description", "")[:400],
                 }
-                for item in value[:5]
-            ]
-        elif field == "education" and isinstance(value, list):
-            compressed[field] = value[:3]
-        elif field in {"skills", "certifications", "projects", "publications"} and isinstance(value, list):
-            compressed[field] = value[:12]
-        else:
-            compressed[field] = value
+                # Extract ownership signals from description
+                desc = item.get("description", "").lower()
+                ownership_signals = []
+                if any(phrase in desc for phrase in ["owned", "led", "built", "created", "developed"]):
+                    ownership_signals.append("ownership")
+                if any(phrase in desc for phrase in ["shipped", "launched", "released", "deployed"]):
+                    ownership_signals.append("delivery")
+                if any(phrase in desc for phrase in ["team", "collaborated", "worked with"]):
+                    ownership_signals.append("collaboration")
+                work_item["ownership_signals"] = ownership_signals
+                work_items.append(work_item)
+            compressed[field] = work_items
+        elif field == "education" and isinstance(resume_json.get(field), list):
+            compressed[field] = resume_json[field][:3]
+        elif field in {"skills", "certifications", "projects", "publications"} and isinstance(resume_json.get(field), list):
+            compressed[field] = resume_json[field][:12]
+        elif field not in compressed:  # Don't overwrite verifiable facts
+            compressed[field] = resume_json.get(field)
+    
+    # Add synthetic qualitative summary for fallback scoring
+    work_exp = resume_json.get("work_experience", [])
+    if work_exp:
+        total_months = sum(item.get("duration_months", 0) for item in work_exp)
+        compressed["synthetic_summary"] = {
+            "total_experience_months": total_months,
+            "role_count": len(set(item.get("role", "") for item in work_exp)),
+            "company_count": len(set(item.get("company", "") for item in work_exp)),
+            "has_ownership_language": any(
+                any(phrase in item.get("description", "").lower() 
+                    for phrase in ["owned", "led", "built", "created", "developed"])
+                for item in work_exp
+            ),
+            "has_delivery_language": any(
+                any(phrase in item.get("description", "").lower() 
+                    for phrase in ["shipped", "launched", "released", "deployed"])
+                for item in work_exp
+            )
+        }
+    
     return compressed
 
 
