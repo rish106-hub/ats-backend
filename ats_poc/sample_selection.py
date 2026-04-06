@@ -202,7 +202,8 @@ def pick_representative_sample(
 ) -> list[dict[str, Any]]:
     scored = []
     for item in parsed_resumes:
-        if not item.get("quality", {}).get("readable", False):
+        quality = item.get("quality", {}) or {}
+        if not quality.get("text_extractable", quality.get("readable", False)):
             continue
         score = score_resume_against_keywords(item["resume_json"], keywords)
         enriched = dict(item)

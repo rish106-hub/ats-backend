@@ -18,6 +18,7 @@ class SessionOut(BaseModel):
     final_config: Optional[Any]
     preview_iteration_count: int
     extra_params_history: Any
+    candidate_feedback_history: Any
     preview_field_results: Optional[Any]
     full_results: Optional[Any]
     token_totals: Any
@@ -67,5 +68,6 @@ class ResumeDetailOut(BaseModel):
     raw_text: Optional[str]
     resume_json: Any
     resume_lens: Any
+    quality: Any
 
     model_config = {"from_attributes": True}

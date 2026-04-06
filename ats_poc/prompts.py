@@ -418,6 +418,15 @@ Rules:
      P0 score below 50: candidate shows [role-specific description of what weak looks like]
      These anchors must be derived from the actual p0 signals and weights, not generic text.
 
+   ABSOLUTE EVALUATION RULE: This is not a competition. Apply every hard filter as a
+   fixed pass/fail threshold — not a curve relative to this batch. If all candidates in
+   the batch fail a baseline check, all must be classified Reject. Do NOT promote the
+   least-bad candidate to Baseline or P0 because no one better is present.
+   P0 means the candidate genuinely matches the P0 signal definitions above, not that
+   they are the top scorer in a weak pool. Baseline means all hard filters passed with
+   some (not exceptional) P0 evidence. Returning all Rejects is the correct output when
+   no one meets the bar. Do not invent weak passes to avoid an all-Reject result.
+
 5. required_resume_fields: only fields referenced by at least one check or signal.
    Always include "name". Do not include unused fields.
 
@@ -505,29 +514,71 @@ Rules:
 """.strip()
 
 CALL_3_SYSTEM = (
-    "You are a resume screening assistant. Evaluate candidates strictly "
-    "against provided criteria. Be objective. Do not infer information "
-    "not present in the resume. Return ONLY valid JSON. No markdown. "
-    "No preamble."
+    "You are a resume screening assistant performing ABSOLUTE THRESHOLD evaluation. "
+    "You score each candidate independently against fixed rubric criteria — you do NOT "
+    "rank candidates relative to each other or spread scores to create a distribution. "
+    "A weak batch does not produce higher scores. A strong batch does not produce lower scores. "
+    "Every score reflects only that candidate's evidence against the rubric. "
+    "It is correct to return all Rejects if nobody meets the baseline. "
+    "Do not infer information not present in the resume. "
+    "Return ONLY valid JSON. No markdown. No preamble."
 )
 
 CALL_3_TEMPLATE = """
-SCREENING CRITERIA:
+╔══════════════════════════════════════════════════════════════╗
+║  ABSOLUTE THRESHOLD MODE — READ BEFORE PROCESSING ANYONE    ║
+╚══════════════════════════════════════════════════════════════╝
+
+You are not ranking candidates against each other.
+You are measuring each candidate against a fixed rubric.
+
+RULE 1 — INDEPENDENT SCORING:
+Score each candidate in complete isolation. Do not look at other candidates'
+scores when scoring any individual. Do not adjust anyone's score up or down
+because of who else is in the batch. Finish each candidate completely before
+starting the next.
+
+RULE 2 — NO CURVE GRADING:
+If all candidates fail a hard filter, all must be classified Reject. "Best of
+a bad batch" is not a valid classification. P0 means the candidate genuinely
+matches the rubric's P0 signal definitions — not that they scored highest
+in a weak pool. It is correct and expected to return all Rejects.
+
+RULE 3 — reject_if_missing FLAG:
+In the SCORING RUBRIC below, baseline_checks have a "reject_if_missing" field.
+  reject_if_missing: true  → hard filter. Failing = baseline_pass: false → Reject.
+  reject_if_missing: false → preference only. Candidate still passes baseline even
+                             if they don't satisfy this check. Do NOT add this to
+                             baseline_failures. It only mildly affects p0_score.
+
+RULE 4 — CALIBRATION ANCHOR:
+Use the SCORING CALIBRATION section in SCREENING CRITERIA to assign all scores.
+Do not invent your own scale. If no anchor is present, use:
+  p0_score 80–100 = direct, explicit evidence for most P0 signals
+  p0_score 50–79  = partial or indirect evidence for some P0 signals
+  p0_score 0–49   = weak or no evidence for P0 signals
+  overall_score: Reject=0–29, Baseline=30–69, P0=70–100
+
+──────────────────────────────────────────────────────────────
+SCREENING CRITERIA (source of truth — includes calibration anchors, overrides, lessons):
+──────────────────────────────────────────────────────────────
 {{FINAL_EVALUATION_PROMPT}}
 
-SCORING RUBRIC:
+──────────────────────────────────────────────────────────────
+SCORING RUBRIC (reject_if_missing: false = preference, not a hard filter):
+──────────────────────────────────────────────────────────────
 {{SCORING_RUBRIC_JSON}}
 
+──────────────────────────────────────────────────────────────
 CANDIDATES:
-{{ARRAY_OF_15_COMPRESSED_RESUMES}}
+──────────────────────────────────────────────────────────────
+{{CANDIDATES_JSON}}
 
 Each candidate entry has two layers:
-- "lens": A recruiter's honest reading of this resume for this specific role — covering
-  ownership arc, domain proximity, craft signals, experience profile, trajectory, HM flag,
-  and red flag notes. Use this for qualitative signal judgment.
+- "lens": recruiter's grounded reading — ownership arc, domain proximity, craft signals,
+  experience profile, trajectory, HM flag, red flag notes. Use for qualitative judgment.
 - Verifiable raw fields (total_experience_years, education, career_gaps_months, etc.):
-  Use these to check hard thresholds — years of experience, credentials, gaps.
-  If the lens and a verifiable field conflict, trust the verifiable field.
+  Use for hard thresholds. If lens and verifiable fields conflict, trust verifiable fields.
 
 Return this JSON:
 
@@ -555,17 +606,29 @@ Return this JSON:
   }
 }
 
-Rules:
-1. overall_score: 0 to 100.
-2. baseline_pass false = automatic Reject regardless of p0_score.
-3. reasoning: 2-3 sentences max. Reference specifics from the lens — ownership arc,
-   domain proximity, craft signals — not just field values. Be concrete.
-4. confidence low = lens and verifiable fields are sparse or contradictory. Flag for human review.
-5. Rank results array by overall_score descending.
-6. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years),
-   treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS.
-   Massive overqualification (e.g., 4+ years for a role asking for 1 year) FAILS.
-   Always convert months to years accurately (12 months = 1 year).
+Per-field scoring rules:
+1. baseline_pass: false ONLY when a reject_if_missing: true check fails. Checks with
+   reject_if_missing: false NEVER cause baseline_pass: false.
+2. baseline_failures: list only the text of checks that actually failed AND had
+   reject_if_missing: true. Do not list relaxed checks or checks that passed.
+3. p0_score: use SCORING CALIBRATION anchors. Score against the rubric definition of
+   exceptional — not against the other candidates in this batch.
+4. classification:
+   - Reject if baseline_pass is false
+   - P0 if baseline_pass is true AND p0_score >= 75 (genuine match to P0 signals)
+   - Baseline if baseline_pass is true AND p0_score < 75
+5. overall_score: Reject 0–29, Baseline 30–69, P0 70–100.
+   Reflect actual evidence. Do not inflate or compress scores to avoid clustering.
+   Clustering at a low score tier is the correct result for a weak batch.
+6. reasoning: 2–3 sentences.
+   (a) Which hard filter passed or failed, and the exact lens evidence that caused it.
+   (b) If a RECRUITER OVERRIDE or FEEDBACK-DERIVED RULE changed this candidate's outcome,
+       state it: "Under the updated rubric, [rule] now [outcome] because [evidence]."
+   (c) Omit (b) if no override applies to this specific candidate.
+7. confidence: "low" if lens is sparse, filler, or contradicts verifiable fields.
+8. Sort results by overall_score descending. Ties are acceptable — do not break artificially.
+9. Years of experience: minor overages PASS. Massive overqualification FAILS.
+   Always convert accurately: 12 months = 1 year.
 """.strip()
 
 GENERIC_SYSTEM = "You are a precise prompt testing assistant. Follow the user's instruction exactly."
@@ -591,6 +654,16 @@ Each candidate entry has two layers:
 - Verifiable raw fields (total_experience_years, education, career_gaps_months, etc.):
   Use these to check hard thresholds — years of experience, credentials, gaps.
   If the lens and a verifiable field conflict, trust the verifiable field.
+
+IMPORTANT — READ THE FULL CRITERIA BEFORE SCORING:
+The CRITERIA_JSON above may contain a "final_evaluation_prompt" field. If it does, read it
+in full before scoring anyone. It contains RECRUITER OVERRIDES, FEEDBACK-DERIVED RULES, and
+SCORING CALIBRATION anchors that supersede the raw baseline_signals and p0_signals arrays.
+- Any check relaxed by a RECRUITER OVERRIDE must NOT be applied as a hard filter.
+- Any FEEDBACK-DERIVED RULE (LESSON [N]: ...) must directly influence baseline_pass and
+  p0_score for every candidate who matches the pattern the lesson describes.
+- The SCORING CALIBRATION anchor points define what P0/Baseline/Reject actually look like
+  for this specific role. Use them to set scores, not intuition.
 
 For each resume, return a detailed field-level analysis. Return this exact JSON:
 
@@ -630,6 +703,8 @@ Rules:
    (ownership_arc, domain_proximity, craft_signals, etc.), use that as the field name.
    When a verifiable raw field was used (total_experience_years, education), use that field name.
 2. criteria_checked: quote the specific criterion from SCREENING CRITERIA that was applied.
+   If a RECRUITER OVERRIDE or FEEDBACK-DERIVED RULE changed how this criterion was applied,
+   quote that rule directly — not the original baseline signal it replaced.
 3. match values:
    - "pass" = clearly satisfies the criterion
    - "fail" = clearly fails the criterion
@@ -637,13 +712,27 @@ Rules:
 4. extra_param_matches: list which extra parameters (if any) this candidate satisfies.
 5. baseline_pass false = automatic Reject regardless of p0_score.
 6. overall_score: 0 to 100. baseline_pass false candidates score below 30.
-7. reasoning: 2-3 sentences. Reference specifics from the lens — ownership arc, domain
-   proximity, craft signals — not just raw field values. Be concrete and honest.
-8. Rank results array by overall_score descending.
-9. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years),
-   treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS.
-   Massive overqualification (e.g., 4+ years for a role asking for 1 year) FAILS.
-   Always convert months to years accurately (12 months = 1 year).
+7. reasoning: 2-3 sentences. Structure:
+   (a) State the primary reason this candidate passes or fails — grounded in their lens
+       (ownership arc, domain proximity, craft signals). Be concrete, not generic.
+   (b) If the criteria contain RECRUITER OVERRIDES or FEEDBACK-DERIVED RULES that changed
+       this candidate's outcome from what the original baseline would have produced, state
+       this explicitly: "Under the updated rubric, [rule/override X] now [passes/fails]
+       this candidate because [specific evidence from their lens]."
+   (c) If no overrides apply to this candidate, omit (b). Do not invent override references.
+8. ABSOLUTE EVALUATION — this is not a competition or relative ranking:
+   - Apply the baseline checks as fixed pass/fail thresholds, not as a curve.
+   - If every candidate in this batch fails one or more baseline checks, every candidate
+     gets baseline_pass: false and classification: Reject. Do NOT promote the least-bad
+     candidate to Baseline or P0 just because they are the best in a weak pool.
+   - P0 means genuinely exceptional against the rubric's P0 signals — not merely the
+     highest scorer in a below-average batch.
+   - It is correct and expected to return all Rejects if no one meets the bar.
+9. Rank results array by overall_score descending.
+10. Mathematical Reasoning: When evaluating "years of experience" brackets (e.g., 1-1.5 years),
+    treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS.
+    Massive overqualification (e.g., 4+ years for a role asking for 1 year) FAILS.
+    Always convert months to years accurately (12 months = 1 year).
 """.strip()
 
 CALL_SYNTHESIZE_SYSTEM = (
@@ -668,6 +757,20 @@ CALL_SYNTHESIZE_SYSTEM = (
     "If candidate feedback implies a pattern: extract the generalised principle and encode it "
     "as a check. Do not just remember the specific candidate — derive the rule. "
     "\n\n"
+    "RECRUITER PSYCHOLOGY RULE: "
+    "Your most important job is to infer how this recruiter thinks. From their includes, excludes, "
+    "approvals, rejections, and disagreements, infer what they trust, what they are skeptical of, "
+    "which candidate traits they reward, which tradeoffs they tolerate, and which patterns cause "
+    "them to reject or downgrade. Encode that recruiter psychology across the ENTIRE rubric — "
+    "hard filters, soft preferences, red flags, score calibration, and the final evaluation prompt. "
+    "Do not leave recruiter intent trapped only in lessons_learned or synthesis_notes. "
+    "\n\n"
+    "FULL REGENERATION RULE: "
+    "Every time recruiter input changes, regenerate the final_evaluation_prompt, baseline_checks, "
+    "p0_weights, red_flag_checks, scoring calibration, and required_resume_fields as one coherent "
+    "system. Do not patch only one section. The output must read like a freshly rebuilt rubric "
+    "that fully incorporates the latest recruiter thinking. "
+    "\n\n"
     "The final_evaluation_prompt is the ONLY thing the grading model sees. Every constraint, "
     "relaxation, and feedback-derived rule must be explicitly stated in it — nothing implicit. "
     "Return ONLY valid JSON. No markdown. No preamble."
@@ -690,6 +793,25 @@ RECRUITER PARAMETERS — ALL ITERATIONS (every include and exclude added so far)
 CANDIDATE FEEDBACK — ALL ITERATIONS (every manual override and disagreement):
 {{CANDIDATE_FEEDBACK_JSON}}
 
+Each feedback entry has these fields — use ALL of them:
+- "file_name": which candidate
+- "action": what the recruiter decided (approve/reject/disagree/strong_yes/strong_no/unclear)
+- "reason": the recruiter's raw explanation — this is your primary calibration signal
+- "current_preview_result": what the current rubric scored this candidate
+    - baseline_pass, classification (P0/Baseline/Reject), p0_score, baseline_failures, reasoning
+    - Use this to understand WHERE the rubric got it wrong relative to the recruiter's expectation
+- "current_full_result": same fields but from the last full evaluation (may be null)
+- "resume_snapshot": the candidate's actual resume content (lens + raw fields)
+    - Use this to understand WHY the rubric got it wrong — what in the resume caused the misfire
+
+MISFIRE ANALYSIS — do this for EVERY disagree/reject/approve action before STEP 3:
+Compare the rubric's classification in current_preview_result with what the recruiter signalled:
+  - If rubric said "Reject" but recruiter approved/strong_yes → rubric is over-filtering. Which check failed that shouldn't have?
+  - If rubric said "P0/Baseline" but recruiter rejected/strong_no → rubric is under-filtering. What did the resume show that the rubric missed?
+  - If rubric said "Baseline" but recruiter said strong_yes → which P0 signal is underweighted for what this candidate showed?
+  - If rubric said "P0" but recruiter said unclear → rubric's confidence signals are miscalibrated
+Read the resume_snapshot to understand the concrete evidence that caused the misfire, then derive a generalised rule.
+
 LAST PREVIEW RESULTS (what the current rubric produced — use to detect misalignment):
 {{PREVIEW_RESULTS_JSON}}
 
@@ -697,8 +819,10 @@ LAST PREVIEW RESULTS (what the current rubric produced — use to detect misalig
 
 Before writing the output, run this internal resolution process:
 
-STEP 1 — CONFLICT DETECTION
-For each "include" parameter in RECRUITER PARAMETERS:
+STEP 1 — CONFLICT DETECTION AND ADDITIVE ENCODING
+For each "include" parameter in RECRUITER PARAMETERS, run BOTH sub-steps:
+
+  STEP 1A — CONFLICT RESOLUTION (relaxation):
   - Does it RELAX or CONTRADICT any existing baseline_check?
   - If YES: that check must change. Options in order of severity:
     (a) Remove the check entirely if the recruiter is saying the dimension doesn't matter
@@ -706,6 +830,39 @@ For each "include" parameter in RECRUITER PARAMETERS:
     (c) Widen the check text so passing it is easier (e.g. "consumer internet OR adjacent domain")
   - Never leave a reject_if_missing: true check that contradicts an include parameter.
     That is a broken rubric.
+
+  STEP 1B — ADDITIVE SIGNAL ENCODING (new positive criterion):
+  - Does this include ADD a new positive criterion NOT already tracked by any existing
+    baseline_check or p0_weight? (i.e. it doesn't conflict — it introduces something new)
+  - If YES: you must add it to the rubric. Do all three:
+    (a) Add a new p0_weight entry:
+          signal: a concise label you derive by interpreting the include's meaning —
+                  use your own knowledge of the domain to understand what the recruiter
+                  is asking for. Do not mechanically copy the include text.
+          weight: 20–30 for a strong differentiator, 10–15 for a mild preference
+          resume_field: pick the most relevant resume section for the subject matter:
+            — "work_experience" for past employers / companies / brands
+            — "education" for universities / degrees / institutions / colleges
+            — "skills" for tools, technologies, certifications
+    (b) Add a corresponding baseline_check with reject_if_missing: false:
+          check: "PREFERRED: [your own clear, observable description of what having
+                  this criterion looks like on a resume — grounded in the include's intent]"
+          — write what PRESENCE looks like, not what absence means
+          — do NOT write "Non-X candidates accepted" or any fallback/absence language
+          — do NOT write FAILS IF language
+          resume_field: same as p0_weight above
+          reject_if_missing: false
+    (c) Add the resume_field to required_resume_fields if not already present.
+  - Use your own knowledge to interpret the include. Examples of interpretation:
+      "top tier indian universities" → your knowledge tells you what top-tier Indian
+          universities are. Encode a signal and check that reflects that understanding.
+          Do not ask the recruiter to elaborate.
+      "top consumer internet companies" → your knowledge tells you which Indian/global
+          companies are top consumer internet brands for this domain. Encode accordingly.
+      "strong analytical background" → interpret based on the role context. For PM roles,
+          this likely means SQL, data tools, experimentation experience.
+  - An include not encoded anywhere in the rubric is a silent ignore. Every include must
+    visibly change at least one of: baseline_checks, p0_weights, or required_resume_fields.
 
 STEP 2 — EXCLUSION ENCODING
 For each "exclude" parameter:
@@ -717,6 +874,17 @@ For each candidate feedback entry (especially disagreements):
   a) READ THE REASON CAREFULLY. The reason is the recruiter's raw signal about what they
      actually value vs. what the rubric is currently measuring. This is your highest-quality
      calibration data.
+
+     ALSO read current_preview_result (or current_full_result if preview is null):
+     - Check the "classification" and "reasoning" fields — this tells you what the rubric
+       concluded and WHY it concluded that.
+     - Compare against the recruiter's action and reason to identify the exact misfire:
+       * "disagree" on a "Reject" → the rubric over-filtered. Which check failed? Was it wrong?
+       * "disagree" on a "P0/Baseline" → the rubric under-filtered. What did it miss?
+       * "strong_yes" on a "Baseline" → a P0 signal is underweighted for this type of candidate.
+       * "strong_no" on a "P0" → the rubric is rewarding something the recruiter doesn't value.
+     ALSO read resume_snapshot.resume_lens and resume_snapshot.resume_json to understand
+     what evidence was present. This tells you what the rubric saw vs. what the recruiter values.
 
   b) Ask two questions:
      1. "What does this reason reveal about a recruiter preference that the current rubric
@@ -742,16 +910,39 @@ For each candidate feedback entry (especially disagreements):
      applies to the entire candidate pool. The rubric should improve even if that
      candidate is never seen again.
 
+STEP 3B — RECRUITER PSYCHOLOGY PROFILE
+After processing all parameters and feedback, infer a recruiter profile from the PATTERN of
+decisions — not just individual votes. Look for what the recruiter consistently approves despite
+rubric disagreement, consistently rejects despite rubric approval, and what reasons keep recurring.
+  - "decision_style": what they optimise for — e.g. "prefers depth over breadth", "rejects anyone without startup experience even at a lower bar"
+  - "must_have_biases": which dimensions they treat as non-negotiable regardless of rubric
+  - "tradeoffs_they_accept": where they are willing to relax — e.g. "will accept B2B if the ownership track record is strong"
+  - "reasons_they_reject": the recurring candidate patterns they consistently downgrade
+  - "signals_they_reward": the recurring candidate patterns they consistently upgrade
+This profile must directly influence baseline_checks, p0_weights, red_flag_checks,
+screening_summary, and final_evaluation_prompt.
+CRITICAL: If the profile says they reward a trait but the corresponding p0_weight has not
+increased, or they penalise a pattern but no red_flag_check exists for it, your output is incomplete.
+Every insight in the recruiter_profile must have a visible corresponding change in the rubric.
+
 STEP 4 — FULL CONSISTENCY CHECK
 Review the final rubric against every include parameter.
-Check ALL THREE of these, not just baselines:
+Check ALL FOUR of these, not just baselines:
 (a) No baseline_check with reject_if_missing: true penalises what the include explicitly permits.
-(b) No red_flag_check penalises or deprioritises candidates on the same dimension the include relaxed.
+(b) No baseline_check's "check" TEXT contains FAILS IF language for a dimension the include relaxed —
+    even if reject_if_missing was set to false. A check with reject_if_missing: false but with
+    "FAILS if: no consumer-facing products" in its text is a broken rubric. The text must be
+    rewritten so it does not disqualify candidates on the relaxed dimension.
+    Example failure: reject_if_missing: false, check = "Must have consumer experience. FAILS if:
+    no consumer products." — this is WRONG. The check text must not contain the disqualifying language.
+    Example correct: reject_if_missing: false, check = "Consumer internet product experience
+    preferred; adjacent B2B or enterprise PM experience is also accepted."
+(c) No red_flag_check penalises or deprioritises candidates on the same dimension the include relaxed.
     Example: if "include candidates without consumer internet experience" was added, then any red flag
     that says "no consumer-facing products" or "not specifying consumer products" must be REMOVED —
     it directly punishes what the recruiter said was acceptable.
-(c) The final_evaluation_prompt's HARD FILTERS section does not list anything the include removed.
-If any of (a), (b), or (c) fail, fix the rubric before returning output.
+(d) The final_evaluation_prompt's HARD FILTERS section does not list anything the include removed.
+If any of (a), (b), (c), or (d) fail, fix the rubric before returning output.
 
 ---
 
@@ -786,6 +977,13 @@ Return this exact JSON:
   },
   "screening_summary": "",
   "synthesis_notes": "",
+  "recruiter_profile": {
+    "decision_style": "",
+    "must_have_biases": [],
+    "tradeoffs_they_accept": [],
+    "reasons_they_reject": [],
+    "signals_they_reward": []
+  },
   "lessons_learned": [
     {
       "candidate": "",
@@ -819,30 +1017,89 @@ Rules:
       These must be updated whenever p0 weights change from prior iterations.
    g) RED FLAGS: red_flag_checks (deprioritise, not auto-reject)
    h) RECRUITER OVERRIDES (this section is mandatory if any include/exclude exists):
-      List each include/exclude verbatim, then state exactly how it changed the rubric:
-      "INCLUDE: [text] → [original check X] is NO LONGER a hard filter / has been widened to Y"
-      "EXCLUDE: [text] → new hard filter added: Z"
+      List each include/exclude verbatim, then state exactly how it changed the rubric.
+      Use the matching format based on what the include did:
+      — Relaxation:  "INCLUDE: [text] → [check X] is NO LONGER a hard filter / widened to: [new standard]"
+      — Additive:    "INCLUDE: [text] → NEW P0 SIGNAL ADDED: [resume_field] checked for [criterion].
+                      Candidates with [criterion] score higher on P0. Not a hard filter."
+      — Exclude:     "EXCLUDE: [text] → new hard filter added: [check text]"
+      Every include must appear here. An include missing from this section will be invisible
+      to the grading model — the grading model reads ONLY this prompt.
    i) FEEDBACK-DERIVED RULES (mandatory if any feedback exists):
       For each lesson in lessons_learned, include one line:
       "LESSON [N]: [lesson text from lessons_learned]. Applied: [rubric_change summary]."
       These lessons teach the grading model what the recruiter actually values beyond the
       baseline filters. They must be specific enough that the grading model would score
       two similar resumes differently based on the lesson.
+   i2) RECRUITER DECISION STYLE (mandatory if any feedback or manual parameter exists):
+      Summarise the recruiter_profile in 2-4 lines. State what the recruiter consistently
+      upgrades, what they penalise, and what tradeoffs they explicitly allow. This section
+      must match the actual rubric changes.
+   j) ABSOLUTE EVALUATION INSTRUCTION (always include this section verbatim):
+      "ABSOLUTE EVALUATION RULE: This is not a competition. Apply every hard filter as a
+      fixed pass/fail threshold — not a curve relative to this batch. If all candidates in
+      the batch fail a baseline check, all must be classified Reject. Do NOT promote the
+      least-bad candidate to Baseline or P0 because no one better is present.
+      P0 means the candidate genuinely matches the P0 signal definitions above, not that
+      they are the top scorer in a weak pool. Baseline means all hard filters passed with
+      some (not exceptional) P0 evidence. Returning all Rejects is the correct output when
+      no one meets the bar. Do not invent weak passes to avoid an all-Reject result."
    The grading model reads ONLY this prompt. A constraint not stated here will not be applied.
 
 2. required_resume_fields: only fields referenced by at least one active check. Always include "name".
 
 3. p0_weights must sum to 100.
 
-4. An "include" that relaxes a dimension:
-   - Set reject_if_missing: FALSE on the conflicting baseline_check (or remove it)
-   - Rewrite the check text to reflect the new, wider standard
-   - Optionally convert it to a p0_weight if the dimension is now a preference not a filter
-   - ALSO: scan all red_flag_checks and remove any that would penalise candidates on that
-     same dimension. An include that relaxes domain X must also remove any red flag that
-     penalises absence of domain X — otherwise the relaxation is cosmetic and the candidate
-     still gets deprioritised. Both the hard filter AND the red flag must be resolved.
+4. An "include" parameter — TWO different cases, each with mandatory actions:
+
+   CASE A: The include RELAXES an existing constraint (conflict with existing check):
+   THREE mandatory changes, all required:
+
+   STEP A — SET THE FLAG:
+   Set reject_if_missing: false on every baseline_check that conflicted with the include.
+   If the check can be removed entirely (the dimension no longer matters at all), remove it.
+
+   STEP B — REWRITE THE CHECK TEXT (this is mandatory, not optional):
+   The "check" field text must be rewritten so it no longer contains the language that
+   was relaxed. If the include says "include candidates without consumer experience",
+   the check text MUST NOT still say "consumer-facing required" or include FAILS IF
+   language that disqualifies candidates on that dimension.
+   The new check text should state the WIDENED standard:
+   - Wrong (only setting flag, not rewriting): check = "Must have consumer internet
+     experience. FAILS if: no consumer-facing products." with reject_if_missing: false
+   - Correct (rewritten): check = "Product management experience preferred in
+     consumer-facing internet products, but B2B or adjacent domains also accepted."
+   If the dimension is being converted to a preference: rewrite the check to start with
+   "PREFERRED:" and remove all FAILS IF language entirely.
+   A check with reject_if_missing: false that still contains FAILS IF: [the relaxed
+   dimension] is a broken rubric — fix both the flag AND the text.
+
+   STEP C — REMOVE CONFLICTING RED FLAGS:
+   Scan all red_flag_checks and remove any that would penalise candidates on the same
+   dimension the include relaxed. An include that relaxes domain X must also remove any
+   red flag that penalises absence of domain X — otherwise the relaxation is cosmetic
+   and the candidate still gets deprioritised. Both the hard filter AND the red flag must
+   be resolved.
+
+   CASE B: The include ADDS a new positive criterion not already in the rubric:
+   THREE mandatory additions, all required:
+   (a) New p0_weight entry — use your knowledge to derive a clear signal label,
+       weight 10–30, resume_field matched to the subject
+   (b) New baseline_check with reject_if_missing: false — check text starts with
+       "PREFERRED:" and describes what having it looks like on a resume.
+       Do NOT write absence language ("Non-X accepted"), fallback language, or FAILS IF.
+   (c) resume_field added to required_resume_fields if not already present
+
+   SELF-CHECK before writing output: For every include in RECRUITER PARAMETERS, confirm:
+   (a) No baseline_check with reject_if_missing: true penalises what the include permits.
+   (b) No baseline_check text (even with reject_if_missing: false) contains FAILS IF
+       language that disqualifies candidates for the dimension the include relaxed.
+   (c) No red_flag_check penalises candidates on the relaxed dimension.
+   (d) Every additive include (CASE B) has a corresponding p0_weight AND baseline_check
+       entry in the output. An include with no rubric change is a silent ignore — fix it.
+   If any of (a), (b), (c), or (d) fail, fix before returning output.
    NEVER leave a check or red flag that penalises what an include explicitly permits.
+   NEVER leave an additive include without a visible rubric entry.
 
 5. An "exclude" that tightens a constraint:
    - Add a new red_flag_check or strengthen an existing baseline_check
@@ -859,7 +1116,16 @@ Rules:
    change. Do not reference the specific candidate in the rubric — derive the rule.
    All prior iteration feedback must remain encoded — do not drop it.
 
-9. lessons_learned: one entry per feedback item (all iterations, not just the latest).
+9. recruiter_profile: concise but specific summary of the recruiter's decision psychology.
+   - decision_style: one sentence describing how they choose between candidates
+   - must_have_biases: 2-5 concrete dimensions they consistently require
+   - tradeoffs_they_accept: 1-5 concrete relaxations they explicitly tolerate
+   - reasons_they_reject: 2-5 concrete recurring failure patterns
+   - signals_they_reward: 2-5 concrete recurring upgrade signals
+   This profile must be derived from recruiter inputs and must stay consistent with the
+   final rubric. Do not output generic hiring advice.
+
+10. lessons_learned: one entry per feedback item (all iterations, not just the latest).
    - "candidate": the file_name of the candidate from the feedback entry
    - "action": what the recruiter did ("disagree", "approve", "reject")
    - "reason_given": the exact reason the recruiter provided — copy it verbatim

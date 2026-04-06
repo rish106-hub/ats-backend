@@ -343,6 +343,7 @@ def infer_career_gaps_months(ranges: list[tuple[tuple[int, int], tuple[int, int]
 
 
 def assess_resume_quality(resume_json: dict[str, Any], raw_text: str) -> dict[str, Any]:
+    word_count = len(raw_text.split())
     populated_fields = 0
     tracked_fields = [
         resume_json.get("name"),
@@ -354,16 +355,34 @@ def assess_resume_quality(resume_json: dict[str, Any], raw_text: str) -> dict[st
         if field:
             populated_fields += 1
 
-    has_text = len(raw_text.split()) >= 80
-    readable = populated_fields >= 2 and has_text
-    score = min(100, populated_fields * 20 + min(40, len(raw_text.split()) // 20))
-    reasons = []
-    if not has_text:
-        reasons.append("Very little extractable text in PDF.")
-    if populated_fields < 2:
-        reasons.append("Most structured resume fields are empty after parsing.")
+    # text_extractable: did we actually get text out of the PDF?
+    # Very low bar (30 words) — only fails for scanned image PDFs or truly corrupt files.
+    # This is the gate used for evaluation inclusion.
+    text_extractable = word_count >= 30
 
-    return {"readable": readable, "score": score, "reasons": reasons}
+    # readable: did our section parser find meaningful structure?
+    # This is a quality signal only — a PDF can be text_extractable but have low structure
+    # if the section headers use non-standard formatting our parser didn't recognise.
+    # Do NOT use this as an evaluation gate.
+    readable = populated_fields >= 2 and word_count >= 80
+
+    score = min(100, populated_fields * 20 + min(40, word_count // 20))
+    reasons = []
+    if not text_extractable:
+        reasons.append("No extractable text — likely a scanned image PDF or corrupt file.")
+    elif not readable:
+        reasons.append(
+            f"Text extracted ({word_count} words) but section parser found only "
+            f"{populated_fields}/4 structured fields. Resume will still be evaluated "
+            f"using raw text."
+        )
+
+    return {
+        "text_extractable": text_extractable,
+        "readable": readable,
+        "score": score,
+        "reasons": reasons,
+    }
 
 
 def parse_resume_text(text: str) -> dict[str, Any]:

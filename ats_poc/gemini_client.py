@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 
@@ -115,6 +116,13 @@ def generate_response(
     return raw_text, usage
 
 
+class GeminiUnavailableError(RuntimeError):
+    """Raised when Gemini returns a transient 503/429 after all retries are exhausted."""
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def run_structured_call(
     model_name: str,
     system_instruction: str,
@@ -123,7 +131,16 @@ def run_structured_call(
     temperature: float = 0.2,
 ) -> tuple[Any, str, dict[str, Any], str]:
     final_prompt = render_template(template, replacements)
-    raw_text, usage = generate_response(model_name, system_instruction, final_prompt, temperature)
+    try:
+        raw_text, usage = generate_response(model_name, system_instruction, final_prompt, temperature)
+    except genai_errors.ServerError as exc:
+        # 503 UNAVAILABLE — model is temporarily overloaded.
+        # Tenacity has already retried; we re-raise as our own error so the
+        # router can return a proper HTTP 503 instead of crashing with 500.
+        raise GeminiUnavailableError(503, str(exc)) from exc
+    except genai_errors.ClientError as exc:
+        # 429 RESOURCE_EXHAUSTED — rate limit hit.
+        raise GeminiUnavailableError(429, str(exc)) from exc
     print(f"Gemini call to {model_name} | {usage.get('total_tokens', 0)} tokens | {usage.get('latency_seconds', 0)}s")
     try:
         parsed_json = extract_json_from_text(raw_text)
