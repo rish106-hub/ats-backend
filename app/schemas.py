@@ -55,6 +55,8 @@ class CandidateFeedback(BaseModel):
 class RefineRequest(BaseModel):
     include: str = ""
     exclude: str = ""
+    update_baseline: str = ""
+    update_p0: str = ""
     api_key: Optional[str] = None
     candidate_feedback: List[CandidateFeedback] = Field(default_factory=list)
 

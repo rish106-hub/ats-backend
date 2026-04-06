@@ -993,12 +993,18 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
     row = _get_session_or_404(session_id, db)
     configure_genai(api_key=_resolve_key(body.api_key))
 
-    if body.include.strip() or body.exclude.strip():
+    has_params = any([
+        body.include.strip(), body.exclude.strip(),
+        body.update_baseline.strip(), body.update_p0.strip(),
+    ])
+    if has_params:
         history = list(row.extra_params_history or [])
         history.append({
             "iteration": row.preview_iteration_count,
             "include": body.include.strip(),
             "exclude": body.exclude.strip(),
+            "update_baseline": body.update_baseline.strip(),
+            "update_p0": body.update_p0.strip(),
         })
         row.extra_params_history = history
 
@@ -1008,7 +1014,7 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
         _run_synthesis(row, db, feedback_dicts)
 
         # Re-score the SAME candidates currently on screen so the recruiter can see
-        # exactly how their include/exclude changed the outcome for those candidates.
+        # exactly how their include/exclude/rubric changes shifted outcomes.
         batch = _get_current_batch(row, db)
         if not batch:
             # Fallback: no previous results, pick a fresh batch
@@ -1026,7 +1032,12 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
     db.add(PreviewIteration(
         session_id=session_id,
         iteration_number=row.preview_iteration_count,
-        extra_params={"include": body.include, "exclude": body.exclude},
+        extra_params={
+            "include": body.include,
+            "exclude": body.exclude,
+            "update_baseline": body.update_baseline,
+            "update_p0": body.update_p0,
+        },
         field_results=results,
         synthesized_config_snapshot=row.synthesized_config,
     ))
