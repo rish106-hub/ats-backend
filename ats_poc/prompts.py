@@ -821,49 +821,64 @@ Before writing the output, run this internal resolution process:
 
 STEP 0 — DIRECT RUBRIC OVERRIDE (run this FIRST, before all other steps)
 Scan every entry in RECRUITER PARAMETERS for "update_baseline" or "update_p0" keys that are non-empty.
-These are the recruiter's DIRECT INSTRUCTIONS about what the rubric itself should say — not hints about
-candidate types, but explicit statements about the screening criteria.
+These are the recruiter's DIRECT INSTRUCTIONS about what the rubric itself should say.
+They come from a separate UI field — they are NOT "include" parameters and must NOT be processed
+through STEP 1's include-relaxation logic.
+
+⚠ WORD COLLISION WARNING: The recruiter may use the word "include" inside an update_baseline or
+update_p0 instruction (e.g. "include only tier-1 university candidates"). In this context,
+"include" means ADD THIS REQUIREMENT TO THE RUBRIC — it does NOT mean relax/soften a check.
+Do not apply STEP 1A (relaxation) to anything from update_baseline or update_p0.
+Update_baseline entries are always processed in STEP 0 only.
+
+DEFAULT INTENT RULE for update_baseline:
+  Unless the recruiter explicitly says "preferred", "soft", "nice to have", or "not required",
+  treat every update_baseline instruction as a HARD FILTER (reject_if_missing: true).
+  "Only tier-1 candidates" → hard filter.
+  "tier-1 preferred" → soft preference (reject_if_missing: false).
+  When in doubt, default to hard filter.
 
 If "update_baseline" is non-empty:
-  Treat this as the recruiter directly rewriting or adding to the baseline_checks.
-  Interpret the instruction and apply it to the baseline_checks list:
-  - If the instruction ADDS a new requirement → add a new baseline_check with reject_if_missing: true
-    and write the "check" field as a precise, observable criterion based on the instruction.
-  - If the instruction MODIFIES an existing check → find the closest matching check and rewrite its
-    "check" text to reflect what the recruiter specified. Keep reject_if_missing unchanged unless
-    the instruction implies a change in severity.
-  - If the instruction REMOVES a requirement → remove the matching check entirely.
-  - If the instruction is about PREFERENCE not hard requirement → add/modify with reject_if_missing: false.
+  Read the instruction as a direct edit to baseline_checks. Apply ONE of:
+  ADD (most common — the recruiter wants a new hard filter):
+    → Add a new baseline_check with reject_if_missing: true.
+      Write the "check" as a precise, observable criterion derived from the instruction.
+      Use your domain knowledge to expand abbreviations (e.g. "tier-1 Indian university"
+      → "IIT, IIM, BITS Pilani, NIT top campuses, SRCC, or equivalent institution").
+  MODIFY (recruiter is changing an existing check):
+    → Find the closest matching check and rewrite its "check" text.
+  REMOVE (recruiter is deleting a requirement):
+    → Remove the matching check entirely.
+  SOFTEN (recruiter explicitly says "preferred" or "not required"):
+    → Add or modify with reject_if_missing: false.
+
   Examples:
-    "Must have tier-1 Indian university education" → add baseline_check: check="Has graduated from a
-    tier-1 Indian institution (IIT, IIM, BITS Pilani, SRCC, or equivalent)", resume_field="education",
-    reject_if_missing: true
-    "Remove the consumer internet requirement" → find and remove the consumer internet baseline_check
-    "Product experience should be preferred, not required" → set reject_if_missing: false on the
-    product experience check
+    "only tier 1 indian candidates" → ADD: check="Has graduated from a tier-1 Indian institution
+    (IIT, IIM, BITS Pilani, SRCC, NIT Trichy, IISC, or equivalent)", resume_field="education",
+    reject_if_missing: true  ← HARD FILTER, not a preference
+    "remove the consumer internet requirement" → REMOVE the matching baseline_check
+    "product experience preferred not required" → SOFTEN: set reject_if_missing: false
+    "must have built a product from scratch" → ADD: hard filter, reject_if_missing: true
 
 If "update_p0" is non-empty:
   Treat this as the recruiter directly rewriting or adding to the p0_weights.
-  Interpret the instruction and apply it to the p0_weights list:
-  - If the instruction ADDS a new signal → add a new p0_weight entry with an appropriate weight
-    (20–35 for a strong differentiator, 10–15 for a secondary signal).
-  - If the instruction MODIFIES a signal → find the closest matching entry and rewrite the "signal"
-    text and/or adjust the "weight".
-  - If the instruction REMOVES a signal → remove the matching p0_weight entry and redistribute weight.
-  - If the instruction changes RELATIVE IMPORTANCE → adjust weights accordingly. After any weight
-    change, normalise all p0_weights to sum to 100.
+  - ADD a new signal → new p0_weight, weight 20–35 for strong differentiator.
+  - MODIFY a signal → rewrite signal text and/or adjust weight.
+  - REMOVE a signal → delete and redistribute weight proportionally.
+  - Change RELATIVE IMPORTANCE → adjust weights, always normalise to sum 100.
   Examples:
-    "Give higher weight to candidates who built 0-to-1 products" → find or add the 0-to-1 signal
-    and increase its weight to 35–40, reducing others proportionally.
-    "Add a signal for scaling to 1M+ users" → add new p0_weight with appropriate weight.
-    "Reduce education weight, focus more on ownership" → lower education weight, increase ownership.
+    "give higher weight to 0-to-1 builders" → increase that signal's weight to 35–40, reduce others.
+    "add a signal for scaling past 1M users" → new p0_weight, ~20–25 weight.
+    "reduce education weight, focus more on ownership" → education weight ↓, ownership weight ↑.
 
 CRITICAL: After applying STEP 0, the final_evaluation_prompt's HARD FILTERS and SCORING SIGNALS
-sections MUST reflect the updated baseline_checks and p0_weights. Do not leave the prompt referring
-to checks that no longer exist or omitting checks that were added.
+sections MUST reflect the updated baseline_checks and p0_weights exactly.
+Any check added in STEP 0 with reject_if_missing: true MUST appear in the HARD FILTERS list.
+STEP 1's include-relaxation logic (STEP 1A) MUST NOT touch anything set in STEP 0.
 
 STEP 1 — CONFLICT DETECTION AND ADDITIVE ENCODING
-For each "include" parameter in RECRUITER PARAMETERS, run BOTH sub-steps:
+For each "include" parameter in RECRUITER PARAMETERS (the "include" key only — not update_baseline),
+run BOTH sub-steps:
 
   STEP 1A — CONFLICT RESOLUTION (relaxation):
   - Does it RELAX or CONTRADICT any existing baseline_check?
