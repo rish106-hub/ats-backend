@@ -834,6 +834,10 @@ def _run_synthesis(row: Session, db: DBSession, new_feedback: list[dict] | None 
             "EXTRA_PARAMS_HISTORY": row.extra_params_history or [],
             "CANDIDATE_FEEDBACK_JSON": row.candidate_feedback_history or [],
             "PREVIEW_RESULTS_JSON": row.preview_field_results or {},
+            # Pass the previous rubric so synthesis PRESERVES checks that were
+            # not touched by the new iteration, instead of rewriting every check
+            # from scratch and producing cosmetic drift.
+            "PREVIOUS_RUBRIC_JSON": row.synthesized_config or {},
         },
     )
     normalized = _normalize_synthesized_config(parsed)
@@ -1063,6 +1067,14 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
         # rubric priorities and the scoring model reads stale context — criteria
         # changes and disagree feedback appear to have no effect on scores.
         batch_files = {r["file_name"] for r in batch}
+        # Ensure every file_name that feedback was given on is in the rescoring batch,
+        # even if it fell out of the displayed preview. Otherwise disagree feedback has
+        # no visible effect because the candidate is never re-scored.
+        for fb in feedback_dicts:
+            fn = fb.get("file_name")
+            if fn:
+                batch_files.add(fn)
+
         batch_resumes = (
             db.query(Resume)
             .filter(Resume.session_id == str(row.id), Resume.file_name.in_(batch_files))
@@ -1076,8 +1088,19 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
         # Re-enrich — now uses synthesized criteria signals via _current_criteria_signals
         _run_resume_enrichment(row, batch_resumes, db)
 
-        # Reload batch dicts so they carry the fresh lenses
-        batch = _get_current_batch(row, db)
+        # Rebuild the batch dict list from the refreshed DB rows so it includes both
+        # the previously-visible preview candidates AND any feedback candidates that
+        # were pulled in for re-scoring.
+        batch = [
+            {
+                "file_name": r.file_name,
+                "resume_json": r.resume_json,
+                "resume_lens": r.resume_lens,
+                "quality": r.quality,
+            }
+            for r in batch_resumes
+            if (r.quality or {}).get("text_extractable", (r.quality or {}).get("readable"))
+        ]
 
         results = _run_preview_scoring(row, batch)
     except GeminiUnavailableError as exc:
@@ -1105,15 +1128,52 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
 
 @router.post("/sessions/{session_id}/preview/reload", response_model=SessionOut)
 def reload_preview(session_id: str, body: StartPreviewRequest, db: DBSession = Depends(get_db)):
+    """Load MORE resumes into the existing preview (append, not replace).
+
+    Picks PREVIEW_BATCH_SIZE additional unseen resumes, adds them to the set of
+    candidates currently in the preview, and re-scores the combined set using the
+    current rubric. The recruiter can keep clicking this to grow the preview to
+    2 → 4 → 6 → ... resumes until they are satisfied with the rubric, then accept
+    to run the FINAL (frozen) rubric on the remaining not-yet-previewed resumes.
+    """
     row = _get_session_or_404(session_id, db)
     configure_genai(api_key=_resolve_key(body.api_key))
 
-    batch = _pick_preview_batch(row, db)
-    if not batch:
+    # Pick PREVIEW_BATCH_SIZE NEW unseen resumes
+    new_batch = _pick_preview_batch(row, db)
+    if not new_batch:
         raise HTTPException(status_code=400, detail="No more readable resumes available to load.")
 
+    # Combine with currently-previewed resumes so the grown batch is scored together
+    existing_batch = _get_current_batch(row, db)
+    combined_by_file: dict[str, dict] = {r["file_name"]: r for r in existing_batch}
+    for r in new_batch:
+        combined_by_file[r["file_name"]] = r
+    combined_batch = list(combined_by_file.values())
+
     try:
-        results = _run_preview_scoring(row, batch)
+        # Ensure lenses exist for the newly-added resumes against the current rubric
+        new_files = {r["file_name"] for r in new_batch}
+        new_resume_rows = (
+            db.query(Resume)
+            .filter(Resume.session_id == str(row.id), Resume.file_name.in_(new_files))
+            .all()
+        )
+        _run_resume_enrichment(row, new_resume_rows, db)
+
+        # Reload combined batch dicts so new rows carry fresh lenses
+        combined_by_file = {r["file_name"]: r for r in _get_current_batch(row, db)}
+        for rr in new_resume_rows:
+            if (rr.quality or {}).get("text_extractable", (rr.quality or {}).get("readable")):
+                combined_by_file[rr.file_name] = {
+                    "file_name": rr.file_name,
+                    "resume_json": rr.resume_json,
+                    "resume_lens": rr.resume_lens,
+                    "quality": rr.quality,
+                }
+        combined_batch = list(combined_by_file.values())
+
+        results = _run_preview_scoring(row, combined_batch)
     except GeminiUnavailableError as exc:
         _raise_gemini_error(exc)
 
@@ -1123,7 +1183,11 @@ def reload_preview(session_id: str, body: StartPreviewRequest, db: DBSession = D
     db.add(PreviewIteration(
         session_id=session_id,
         iteration_number=row.preview_iteration_count,
-        extra_params={"action": "reloaded_resumes"},
+        extra_params={
+            "action": "loaded_more_resumes",
+            "added_count": len(new_batch),
+            "total_in_preview": len(combined_batch),
+        },
         field_results=results,
         synthesized_config_snapshot=row.synthesized_config or row.base_criteria,
     ))
@@ -1206,23 +1270,54 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
     if unreadable:
         print(f"[FULL EVAL] Skipped files: {[r.file_name for r in unreadable]}")
 
+    # Collect the set of files the recruiter already finalized in preview.
+    # Those get their preview verdict carried directly into final results —
+    # the rubric the recruiter approved was evaluated against them already,
+    # and re-scoring them would (a) waste Gemini calls and (b) risk drift.
+    preview_results_by_file: dict[str, dict] = {}
+    preview_field_results = row.preview_field_results or {}
+    preview_items = preview_field_results.get("results") or [] if isinstance(preview_field_results, dict) else []
+
+    # Map preview candidate_name → file_name via the Resume table
+    name_to_file_map: dict[str, str] = {}
+    for r in readable:
+        nm = ((r.resume_json or {}).get("name") or "").strip().lower()
+        stem = r.file_name.replace(".pdf", "").replace("_", " ").replace("-", " ").strip().lower()
+        if nm:
+            name_to_file_map[nm] = r.file_name
+        name_to_file_map[stem] = r.file_name
+        name_to_file_map[r.file_name.lower()] = r.file_name
+    for item in preview_items:
+        if not isinstance(item, dict):
+            continue
+        cname = (item.get("candidate_name") or "").strip().lower()
+        fname = name_to_file_map.get(cname)
+        if fname:
+            preview_results_by_file[fname] = item
+
+    # Split readable resumes into "already scored in preview" vs "needs scoring"
+    already_scored = [r for r in readable if r.file_name in preview_results_by_file]
+    needs_scoring  = [r for r in readable if r.file_name not in preview_results_by_file]
+
+    print(
+        f"[FULL EVAL] carried over from preview: {len(already_scored)}, "
+        f"to score now: {len(needs_scoring)}"
+    )
+
     try:
-        # Invalidate ALL lenses before full eval so every resume is re-generated
-        # against the FINAL synthesized criteria (which reflect all preview iterations,
-        # include/exclude params, and disagree feedback accumulated so far).
-        # Lenses generated at first-preview time used the original JD signals — they
-        # are now stale and will cause scoring to ignore rubric updates.
-        for r in readable:
+        # Invalidate lenses ONLY for the remaining (unscored) resumes and regenerate
+        # against the FINAL synthesized rubric. Previewed resumes already have lenses
+        # aligned to the rubric the recruiter approved.
+        for r in needs_scoring:
             r.resume_lens = None
             db.add(r)
         db.flush()
+        _run_resume_enrichment(row, needs_scoring, db)
 
-        # Re-enrich all readable resumes with the final synthesized criteria
-        _run_resume_enrichment(row, readable, db)
-
-        # Reload readable list so resume_lens values are fresh
-        readable = db.query(Resume).filter(Resume.session_id == session_id).all()
-        readable = [r for r in readable if _is_extractable(r)]
+        # Reload so fresh lenses are in memory
+        refreshed = db.query(Resume).filter(Resume.session_id == session_id).all()
+        refreshed_by_file = {r.file_name: r for r in refreshed}
+        needs_scoring = [refreshed_by_file[r.file_name] for r in needs_scoring if r.file_name in refreshed_by_file]
     except GeminiUnavailableError as exc:
         _raise_gemini_error(exc)
 
@@ -1234,7 +1329,7 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
             "resume_lens": r.resume_lens,
             "quality": r.quality,
         }
-        for r in readable
+        for r in needs_scoring
     ]
 
     # Evaluate ALL readable resumes — no cap, no sampling.
@@ -1269,6 +1364,14 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
         expected_names.append(normalized_name)
         name_to_file[normalized_name.lower()] = r["file_name"]
 
+    # Also reserve slots for the preview-carryover candidates so they survive
+    # the expected-names filter in _normalize_scoring_output.
+    for file_name, preview_item in preview_results_by_file.items():
+        carry_name = (preview_item.get("candidate_name") or file_name).strip()
+        if carry_name and carry_name.lower() not in {n.lower() for n in expected_names}:
+            expected_names.append(carry_name)
+    expected_names_lower_set = {n.strip().lower() for n in expected_names}
+
     # ── Batched CALL_3 ────────────────────────────────────────────────────────
     # Send CALL_3_BATCH_SIZE resumes per sub-call and merge results.
     # Sending all resumes in one call causes Gemini to silently drop candidates
@@ -1276,58 +1379,91 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
     all_results: list[dict] = []
     model_dropped: list[dict] = []
 
-    try:
-        for batch_idx in range(0, len(scored_payloads), CALL_3_BATCH_SIZE):
-            chunk = scored_payloads[batch_idx : batch_idx + CALL_3_BATCH_SIZE]
-            batch_label = f"Call 3 batch {batch_idx // CALL_3_BATCH_SIZE + 1}"
-            print(f"[FULL EVAL] {batch_label}: scoring {len(chunk)} resume(s)")
+    def _score_chunk(chunk: list[dict], batch_label: str) -> list[dict]:
+        chunk_parsed, _raw, usage, _prompt = run_structured_call(
+            model_name=MODEL_NAME,
+            system_instruction=CALL_3_SYSTEM,
+            template=CALL_3_TEMPLATE,
+            replacements={
+                "FINAL_EVALUATION_PROMPT": prompt_text,
+                "SCORING_RUBRIC_JSON": rubric,
+                "CANDIDATES_JSON": chunk,
+            },
+        )
+        _accumulate_tokens(row, batch_label, usage)
+        return chunk_parsed.get("results", []) if isinstance(chunk_parsed, dict) else []
 
-            chunk_parsed, _raw, usage, _prompt = run_structured_call(
-                model_name=MODEL_NAME,
-                system_instruction=CALL_3_SYSTEM,
-                template=CALL_3_TEMPLATE,
-                replacements={
-                    "FINAL_EVALUATION_PROMPT": prompt_text,
-                    "SCORING_RUBRIC_JSON": rubric,
-                    "CANDIDATES_JSON": chunk,
-                },
-            )
-            _accumulate_tokens(row, batch_label, usage)
+    for batch_idx in range(0, len(scored_payloads), CALL_3_BATCH_SIZE):
+        chunk = scored_payloads[batch_idx : batch_idx + CALL_3_BATCH_SIZE]
+        batch_label = f"Call 3 batch {batch_idx // CALL_3_BATCH_SIZE + 1}"
+        print(f"[FULL EVAL] {batch_label}: scoring {len(chunk)} resume(s)")
 
-            chunk_results = (
-                chunk_parsed.get("results", [])
-                if isinstance(chunk_parsed, dict)
-                else []
-            )
-            all_results.extend(chunk_results)
+        chunk_results: list[dict] = []
+        # Attempt 1 — main call
+        try:
+            chunk_results = _score_chunk(chunk, batch_label)
+        except GeminiUnavailableError as exc:
+            print(f"[CALL_3 ERROR] {batch_label} attempt 1 failed: {exc}. Retrying once...")
+        except Exception as exc:
+            print(f"[CALL_3 ERROR] {batch_label} attempt 1 crashed: {exc}. Retrying once...")
 
-            # Per-batch drop detection — compare names sent vs names returned
-            returned_in_chunk: set[str] = {
-                r["candidate_name"].strip().lower()
-                for r in chunk_results
-                if isinstance(r, dict) and r.get("candidate_name")
-            }
-            for payload in chunk:
-                sent_name = (payload.get("name") or "").strip().lower()
-                if sent_name and sent_name not in returned_in_chunk:
-                    file_name = name_to_file.get(sent_name, sent_name)
-                    model_dropped.append({
-                        "file_name": file_name,
-                        "reason": (
-                            "Resume was sent to the evaluation model but absent from its output "
-                            f"(batch {batch_idx // CALL_3_BATCH_SIZE + 1}). "
-                            "Re-run the full evaluation to retry this candidate."
-                        ),
-                    })
-                    print(f"[CALL_3 DROP] '{sent_name}' missing from {batch_label} output.")
-    except GeminiUnavailableError as exc:
-        _raise_gemini_error(exc)
+        # Per-batch drop detection
+        returned_in_chunk: set[str] = {
+            r["candidate_name"].strip().lower()
+            for r in chunk_results
+            if isinstance(r, dict) and r.get("candidate_name")
+        }
+        missing_payloads = [
+            p for p in chunk
+            if (p.get("name") or "").strip().lower() not in returned_in_chunk
+        ]
+
+        # Attempt 2 — one retry for only the still-missing resumes, isolated further
+        if missing_payloads:
+            print(f"[CALL_3 RETRY] {batch_label}: retrying {len(missing_payloads)} missing resume(s)")
+            for payload in missing_payloads:
+                retry_label = f"{batch_label} retry {payload.get('name', '?')}"
+                try:
+                    retry_results = _score_chunk([payload], retry_label)
+                    chunk_results.extend(retry_results)
+                except Exception as exc:
+                    print(f"[CALL_3 RETRY FAIL] {retry_label}: {exc}")
+
+        all_results.extend(chunk_results)
+
+        # Final drop detection after retries
+        final_returned: set[str] = {
+            r["candidate_name"].strip().lower()
+            for r in chunk_results
+            if isinstance(r, dict) and r.get("candidate_name")
+        }
+        for payload in chunk:
+            sent_name = (payload.get("name") or "").strip().lower()
+            if sent_name and sent_name not in final_returned:
+                file_name = name_to_file.get(sent_name, sent_name)
+                model_dropped.append({
+                    "file_name": file_name,
+                    "reason": (
+                        "Resume was sent to the evaluation model and did not come back "
+                        "even after a retry. Re-run the full evaluation to try again."
+                    ),
+                })
+                print(f"[CALL_3 DROP] '{sent_name}' missing from {batch_label} after retry.")
 
     if model_dropped:
         print(
             f"[CALL_3 DROP WARNING] {len(model_dropped)} resume(s) dropped across all batches: "
             f"{[d['file_name'] for d in model_dropped]}"
         )
+
+    # Carry over the already-approved preview verdicts so the recruiter's approved
+    # rubric is not re-run against resumes they already signed off on.
+    for file_name, preview_item in preview_results_by_file.items():
+        carried = dict(preview_item)
+        carried["_source"] = "preview_carryover"
+        all_results.append(carried)
+        if file_name not in expected_names_lower_set:
+            expected_names.append(preview_item.get("candidate_name", file_name))
 
     # Reconstruct a single parsed dict from all batches with a stable shape.
     parsed = _normalize_scoring_output(
@@ -1369,7 +1505,7 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
             "sampled_out": [
                 {
                     "file_name": r["file_name"],
-                    "reason": f"Excluded by representative sampling — upload exceeded {FULL_EVAL_BATCH_SIZE} resume cap.",
+                    "reason": "Excluded by representative sampling.",
                 }
                 for r in sampled_out
             ],

@@ -551,6 +551,20 @@ In the SCORING RUBRIC below, baseline_checks have a "reject_if_missing" field.
                              if they don't satisfy this check. Do NOT add this to
                              baseline_failures. It only mildly affects p0_score.
 
+RULE 3B — REASON ABOUT TYPE, NOT NAME, FOR TIER / REPUTATION CHECKS:
+When a baseline_check or p0 signal references "tier-1", "top", "reputed", "elite", or any
+other reputation-based category (universities, companies, brands, programs):
+  • DO NOT perform literal string matching on institution or company names.
+  • DO NOT treat any example names embedded in the check text as an exhaustive whitelist.
+  • REASON about the TYPE of institution/company: what kind of place is it, what is its
+    standing in its country/industry, how is it regarded by hiring managers in this space?
+  • Use your own domain knowledge to decide whether the candidate's school or employer
+    belongs to the category the check is describing.
+  • If the institution is widely regarded as top-tier in its country/domain, it PASSES —
+    regardless of whether its exact name appears in the check text or in any example list.
+  • Only reject a reputation check when the institution/company is genuinely outside the
+    category based on your own knowledge of the type of place it is.
+
 RULE 4 — CALIBRATION ANCHOR:
 Use the SCORING CALIBRATION section in SCREENING CRITERIA to assign all scores.
 Do not invent your own scale. If no anchor is present, use:
@@ -629,6 +643,19 @@ Per-field scoring rules:
 8. Sort results by overall_score descending. Ties are acceptable — do not break artificially.
 9. Years of experience: minor overages PASS. Massive overqualification FAILS.
    Always convert accurately: 12 months = 1 year.
+   YEARS-OF-EXPERIENCE AUDIT PROTOCOL (mandatory when a YoE check exists):
+   a) Read "total_experience_years" from the candidate payload if present. Otherwise
+      sum duration_months across every entry in "work_experience" and divide by 12.
+   b) State the computed number in reasoning: "Computed YoE = X.Y years from N roles".
+   c) Compare to the rubric threshold explicitly. Do NOT eyeball it.
+   d) If the payload has neither total_experience_years nor work_experience, set
+      confidence to "low" and note the missing data in reasoning.
+
+10. BASELINE AUDIT — baseline_failures MUST list every failed hard check with a one-line
+    evidence quote from the lens or a verifiable field. Format:
+      "[check text] → FAILED because [evidence]"
+    Do NOT return an empty baseline_failures while also setting baseline_pass=false.
+    Do NOT return baseline_pass=true while any hard check actually failed.
 """.strip()
 
 GENERIC_SYSTEM = "You are a precise prompt testing assistant. Follow the user's instruction exactly."
@@ -654,6 +681,18 @@ Each candidate entry has two layers:
 - Verifiable raw fields (total_experience_years, education, career_gaps_months, etc.):
   Use these to check hard thresholds — years of experience, credentials, gaps.
   If the lens and a verifiable field conflict, trust the verifiable field.
+
+REASON ABOUT TYPE, NOT NAME, FOR TIER / REPUTATION CHECKS:
+When a check references "tier-1", "top", "reputed", "elite", or any reputation-based
+category (universities, companies, brands, programs):
+  • DO NOT literal-string-match institution or company names.
+  • Reason about the TYPE of place: what kind of institution is it, what is its standing,
+    how is it regarded by hiring managers in this space?
+  • Use your own domain knowledge to decide category membership.
+  • If the institution/company is widely regarded as top-tier in its country/domain, it
+    PASSES — regardless of whether its exact name is mentioned anywhere in the check.
+  • Only reject a reputation check when the place is genuinely outside the category based
+    on what kind of institution/company it is.
 
 IMPORTANT — READ THE FULL CRITERIA BEFORE SCORING:
 The CRITERIA_JSON above may contain a "final_evaluation_prompt" field. If it does, read it
@@ -733,6 +772,15 @@ Rules:
     treat the upper bound reasonably. Minor overages (e.g., 20 months vs 1.5 years) PASS.
     Massive overqualification (e.g., 4+ years for a role asking for 1 year) FAILS.
     Always convert months to years accurately (12 months = 1 year).
+    YEARS-OF-EXPERIENCE AUDIT PROTOCOL (mandatory when a YoE check exists):
+    a) Use "total_experience_years" from the candidate payload if present. Otherwise sum
+       duration_months across "work_experience" and divide by 12.
+    b) State the computed number in reasoning: "Computed YoE = X.Y years".
+    c) Compare to the rubric threshold explicitly.
+11. BASELINE AUDIT: baseline_failures MUST list every failed hard check with evidence.
+    Format each entry as: "[check text] → FAILED because [one-line evidence quote]".
+    Never leave baseline_failures empty while baseline_pass is false, and never set
+    baseline_pass true if any hard check actually failed.
 """.strip()
 
 CALL_SYNTHESIZE_SYSTEM = (
@@ -777,6 +825,38 @@ CALL_SYNTHESIZE_SYSTEM = (
 )
 
 CALL_SYNTHESIZE_TEMPLATE = """
+⚠ STABILITY RULE — READ BEFORE EVERYTHING ELSE ⚠
+The PREVIOUS_RUBRIC_JSON below is the rubric produced by the last synthesis run.
+If it is non-empty, you MUST treat it as the anchor for this run. Specifically:
+  • Any baseline_check, p0_weight, red_flag_check, or line in final_evaluation_prompt that
+    is NOT affected by the newest iteration entry MUST be returned BYTE-IDENTICAL to how it
+    appears in PREVIOUS_RUBRIC_JSON. Do not paraphrase. Do not reorder. Do not rewrite.
+  • Only modify the specific items that the newest recruiter entry (include / exclude /
+    update_baseline / update_p0 / feedback) actually targets.
+  • If the newest entry is "already encoded in a prior iteration", return the previous
+    rubric verbatim with no changes at all.
+  • Cosmetic drift — rewording unchanged checks, reordering lists, changing weights by
+    ±1-2, tweaking calibration anchor phrasing — is a BUG. It causes the scoring model to
+    produce different scores for the same candidate across iterations. Do not do this.
+This rule overrides any instinct to "clean up" or "improve" the previous rubric.
+
+PREVIOUS RUBRIC (the last synthesized rubric — preserve verbatim where not affected):
+{{PREVIOUS_RUBRIC_JSON}}
+
+⚠ ACCUMULATION RULE — READ FIRST, APPLIES TO EVERYTHING BELOW ⚠
+RECRUITER PARAMETERS and CANDIDATE FEEDBACK are FULL HISTORIES — every iteration from
+the very first edit to the latest. You MUST process every entry. A later entry does
+NOT replace an earlier one unless it explicitly contradicts it. Specifically:
+  • Every non-empty "update_baseline" across ALL iterations must be applied (STEP 0).
+  • Every non-empty "update_p0" across ALL iterations must be applied (STEP 0).
+  • Every "include" across ALL iterations must be encoded (STEP 1).
+  • Every "exclude" across ALL iterations must be encoded (STEP 2).
+  • Every feedback entry across ALL iterations must produce a lesson (STEP 3).
+Before writing output, count the entries you received vs the entries you applied.
+If the counts differ, you are dropping recruiter intent — go back and apply them.
+The synthesis_notes field must contain one line per entry explaining how it was applied
+(or "already encoded in prior iteration — no new change" if it is a duplicate).
+
 BASE CRITERIA (starting point — any check can be relaxed, demoted, or removed by recruiter parameters):
 {{BASE_CRITERIA_JSON}}
 
@@ -843,8 +923,10 @@ If "update_baseline" is non-empty:
   ADD (most common — the recruiter wants a new hard filter):
     → Add a new baseline_check with reject_if_missing: true.
       Write the "check" as a precise, observable criterion derived from the instruction.
-      Use your domain knowledge to expand abbreviations (e.g. "tier-1 Indian university"
-      → "IIT, IIM, BITS Pilani, NIT top campuses, SRCC, or equivalent institution").
+      Write the check as the recruiter's INTENT, not a fixed whitelist of institution names.
+      Do NOT enumerate a closed list of schools/companies — that causes the grading model to
+      reject anything not on the list by literal string match. Instead, describe the category
+      and delegate tier judgment to the grading model's own domain knowledge.
   MODIFY (recruiter is changing an existing check):
     → Find the closest matching check and rewrite its "check" text.
   REMOVE (recruiter is deleting a requirement):
@@ -853,9 +935,14 @@ If "update_baseline" is non-empty:
     → Add or modify with reject_if_missing: false.
 
   Examples:
-    "only tier 1 indian candidates" → ADD: check="Has graduated from a tier-1 Indian institution
-    (IIT, IIM, BITS Pilani, SRCC, NIT Trichy, IISC, or equivalent)", resume_field="education",
-    reject_if_missing: true  ← HARD FILTER, not a preference
+    "only tier 1 indian candidates" → ADD: check="Candidate graduated from a tier-1 Indian
+    institution. The grading model decides tier based on its own knowledge of institutional
+    reputation in India — do NOT rely on literal name matching. When in doubt about a
+    specific institution, err toward inclusion if it is widely regarded as top-tier.",
+    resume_field="education", reject_if_missing: true  ← HARD FILTER
+    ⚠ DO NOT enumerate any institution names in the check text. No IIT, IIM, NIT, BITS, ISB,
+    SRCC, IISc, etc. The check must be written as intent only — naming examples teaches the
+    grading model to literal-match and reject anything not on the list.
     "remove the consumer internet requirement" → REMOVE the matching baseline_check
     "product experience preferred not required" → SOFTEN: set reject_if_missing: false
     "must have built a product from scratch" → ADD: hard filter, reject_if_missing: true

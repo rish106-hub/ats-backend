@@ -157,7 +157,13 @@ def compress_resume(resume_json: dict[str, Any], required_fields: list[str]) -> 
 
 # Fields that carry hard verifiable facts — always included alongside the lens
 # so the scoring model can check thresholds without re-interpreting raw descriptions.
-_VERIFIABLE_FACT_FIELDS = {"total_experience_years", "career_gaps_months", "education", "github_url"}
+_VERIFIABLE_FACT_FIELDS = {
+    "total_experience_years",
+    "career_gaps_months",
+    "education",
+    "work_experience",
+    "github_url",
+}
 
 
 def build_scored_resume_payload(
@@ -183,14 +189,48 @@ def build_scored_resume_payload(
     # Drop internal file_name key from lens before sending to scoring model
     payload["lens"] = {k: v for k, v in resume_lens.items() if k != "file_name"}
 
-    # Append verifiable raw fact fields referenced by the rubric
-    for field in required_fields:
-        if field in _VERIFIABLE_FACT_FIELDS and field in resume_json:
+    # ALWAYS attach verifiable facts — the scoring model must be able to check
+    # years-of-experience, career gaps, and education without depending on whether
+    # the synthesized rubric happened to list them in required_resume_fields.
+    # These are cheap, objective, and every rubric needs them.
+    for field in _VERIFIABLE_FACT_FIELDS:
+        if field in resume_json and resume_json[field] not in (None, "", []):
             value = resume_json[field]
             if field == "education" and isinstance(value, list):
                 payload[field] = value[:3]
+            elif field == "work_experience" and isinstance(value, list):
+                # Trim heavy prose but keep company/role/duration/type so the
+                # scoring model can audit YoE, tenure, and career arc.
+                trimmed = []
+                for job in value[:8]:
+                    trimmed.append({
+                        "company": job.get("company", ""),
+                        "role": job.get("role", ""),
+                        "duration_months": job.get("duration_months", 0),
+                        "type": job.get("type", ""),
+                        "description": (job.get("description", "") or "")[:300],
+                    })
+                payload[field] = trimmed
             else:
                 payload[field] = value
+
+    # Also attach any additional required fields the rubric references
+    for field in required_fields:
+        if field in payload or field in _VERIFIABLE_FACT_FIELDS:
+            continue
+        if field in resume_json and resume_json[field] not in (None, "", []):
+            value = resume_json[field]
+            if isinstance(value, list):
+                payload[field] = value[:5]
+            else:
+                payload[field] = value
+
+    # Derived convenience fields — make YoE impossible to miss.
+    work_exp = resume_json.get("work_experience", []) or []
+    if work_exp and "total_experience_years" not in payload:
+        total_months = sum((j.get("duration_months") or 0) for j in work_exp)
+        if total_months:
+            payload["total_experience_years"] = round(total_months / 12, 1)
 
     return payload
 
