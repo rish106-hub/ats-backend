@@ -90,7 +90,7 @@ def generate_response(
     model_name: str,
     system_instruction: str,
     user_prompt: str,
-    temperature: float = 0.2,
+    temperature: float = 0.0,
 ) -> tuple[str, dict[str, Any]]:
     started_at = time.perf_counter()
     client = _get_client()
@@ -128,7 +128,7 @@ def run_structured_call(
     system_instruction: str,
     template: str,
     replacements: dict[str, Any],
-    temperature: float = 0.2,
+    temperature: float = 0.0,
 ) -> tuple[Any, str, dict[str, Any], str]:
     final_prompt = render_template(template, replacements)
     try:
@@ -154,7 +154,7 @@ def run_raw_call(
     model_name: str,
     system_instruction: str,
     user_prompt: str,
-    temperature: float = 0.2,
+    temperature: float = 0.0,
 ) -> tuple[str, dict[str, Any], Any | None]:
     raw_text, usage = generate_response(model_name, system_instruction, user_prompt, temperature)
     parsed_json = None

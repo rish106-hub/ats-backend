@@ -50,11 +50,10 @@ LENS_BATCH_SIZE = 6
 # Maximum resumes sent to CALL_3 (full evaluation).
 # Set high enough that typical uploads are never silently truncated.
 # Token budget: ~800 tokens/resume × 50 = 40K candidate tokens, well within context.
-FULL_EVAL_BATCH_SIZE = 50
-# Number of resumes per CALL_3 sub-batch.
-# Gemini silently drops candidates when given too many at once.
-# 8 per call keeps the payload small enough that every resume comes back.
-CALL_3_BATCH_SIZE = 8
+# Number of resumes per CALL_3 sub-batch sent to Gemini.
+# All readable resumes are evaluated — there is no total cap.
+# Each sub-batch is small enough that Gemini reliably returns every candidate.
+CALL_3_BATCH_SIZE = 1
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -571,8 +570,45 @@ def _validate_lens(lens: dict) -> bool:
     return True
 
 
+def _current_criteria_signals(row: Session) -> tuple[list, list]:
+    """Return (baseline_signals, p0_signals) from synthesized config if available,
+    else fall back to the original JD analysis signals.
+
+    After any synthesis (include/exclude/feedback), the synthesized rubric has
+    updated checks that reflect the recruiter's current intent. The lens must be
+    generated against THOSE signals so the recruiter's reading is aligned with what
+    the scoring model will actually evaluate.
+    """
+    synth = row.synthesized_config or {}
+    rubric = synth.get("scoring_rubric") or {}
+    baseline_checks = rubric.get("baseline_checks") or []
+    p0_weights = rubric.get("p0_weights") or []
+
+    if baseline_checks or p0_weights:
+        # Use synthesized signals — these reflect all include/exclude/feedback changes
+        baseline_signals = [
+            _coerce_str(c.get("check"))
+            for c in baseline_checks
+            if isinstance(c, dict) and c.get("reject_if_missing", True) and c.get("check")
+        ]
+        p0_signals = [
+            _coerce_str(w.get("signal"))
+            for w in p0_weights
+            if isinstance(w, dict) and w.get("signal")
+        ]
+        return baseline_signals, p0_signals
+
+    # Fall back to original JD analysis
+    jd = row.jd_analysis or {}
+    return jd.get("baseline_signals", []), jd.get("p0_signals", [])
+
+
 def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -> None:
     """Read each resume's full raw text through the JD lens and store the result.
+
+    Uses synthesized criteria signals when available so the lens reflects the
+    recruiter's current rubric (after any include/exclude/feedback changes), not
+    just the original JD.
 
     Idempotent — only processes resumes where resume_lens is None.
     Batched in groups of LENS_BATCH_SIZE to keep token payloads manageable.
@@ -585,8 +621,8 @@ def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -
         return
 
     jd = row.jd_analysis or {}
-    # Pass gap_questions so the lens knows what JD ambiguities exist even if unanswered
     gap_context = jd.get("gap_questions", [])
+    baseline_signals, p0_signals = _current_criteria_signals(row)
 
     for i in range(0, len(un_lensed), LENS_BATCH_SIZE):
         batch = un_lensed[i : i + LENS_BATCH_SIZE]
@@ -605,8 +641,8 @@ def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -
                 "ROLE_TYPE": jd.get("role_type", "unknown"),
                 "ROLE_CONTEXT": jd.get("role_context", {}),
                 "ONE_LINER": jd.get("one_liner", ""),
-                "BASELINE_SIGNALS": jd.get("baseline_signals", []),
-                "P0_SIGNALS": jd.get("p0_signals", []),
+                "BASELINE_SIGNALS": baseline_signals,
+                "P0_SIGNALS": p0_signals,
                 "GAP_ANSWERS": gap_context,
                 "RESUMES": resume_inputs_str,
             },
@@ -1022,6 +1058,27 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
         if not batch:
             raise HTTPException(status_code=400, detail="No readable resumes found.")
 
+        # Invalidate lenses for the current batch so they are re-generated against
+        # the UPDATED synthesized criteria. Without this, the lens reflects the old
+        # rubric priorities and the scoring model reads stale context — criteria
+        # changes and disagree feedback appear to have no effect on scores.
+        batch_files = {r["file_name"] for r in batch}
+        batch_resumes = (
+            db.query(Resume)
+            .filter(Resume.session_id == str(row.id), Resume.file_name.in_(batch_files))
+            .all()
+        )
+        for r in batch_resumes:
+            r.resume_lens = None
+            db.add(r)
+        db.flush()
+
+        # Re-enrich — now uses synthesized criteria signals via _current_criteria_signals
+        _run_resume_enrichment(row, batch_resumes, db)
+
+        # Reload batch dicts so they carry the fresh lenses
+        batch = _get_current_batch(row, db)
+
         results = _run_preview_scoring(row, batch)
     except GeminiUnavailableError as exc:
         _raise_gemini_error(exc)
@@ -1150,8 +1207,22 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
         print(f"[FULL EVAL] Skipped files: {[r.file_name for r in unreadable]}")
 
     try:
-        # Enrich any resumes not yet lensed (e.g. never appeared in a preview batch)
+        # Invalidate ALL lenses before full eval so every resume is re-generated
+        # against the FINAL synthesized criteria (which reflect all preview iterations,
+        # include/exclude params, and disagree feedback accumulated so far).
+        # Lenses generated at first-preview time used the original JD signals — they
+        # are now stale and will cause scoring to ignore rubric updates.
+        for r in readable:
+            r.resume_lens = None
+            db.add(r)
+        db.flush()
+
+        # Re-enrich all readable resumes with the final synthesized criteria
         _run_resume_enrichment(row, readable, db)
+
+        # Reload readable list so resume_lens values are fresh
+        readable = db.query(Resume).filter(Resume.session_id == session_id).all()
+        readable = [r for r in readable if _is_extractable(r)]
     except GeminiUnavailableError as exc:
         _raise_gemini_error(exc)
 
@@ -1166,21 +1237,11 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
         for r in readable
     ]
 
-    # Evaluate every readable resume up to FULL_EVAL_BATCH_SIZE.
-    # Only sample down if the upload is unusually large.
-    if len(resume_dicts) <= FULL_EVAL_BATCH_SIZE:
-        batch = resume_dicts
-    else:
-        print(
-            f"[FULL EVAL] {len(resume_dicts)} readable resumes exceeds cap "
-            f"({FULL_EVAL_BATCH_SIZE}). Sampling down — consider raising FULL_EVAL_BATCH_SIZE."
-        )
-        keywords = extract_keywords(row.jd_text or "", row.base_criteria or {}, config or {})
-        batch = pick_representative_sample(resume_dicts, keywords, sample_size=FULL_EVAL_BATCH_SIZE)
-
-    # Track which readable resumes were sampled out (only possible when > FULL_EVAL_BATCH_SIZE)
-    batch_files = {r["file_name"] for r in batch}
-    sampled_out = [r for r in resume_dicts if r["file_name"] not in batch_files]
+    # Evaluate ALL readable resumes — no cap, no sampling.
+    # CALL_3 is batched internally (CALL_3_BATCH_SIZE per Gemini call) so
+    # any number of resumes is handled correctly.
+    batch = resume_dicts
+    sampled_out: list[dict] = []  # never populated — kept for _skipped shape consistency
 
     # Build scored payloads — lens + verifiable facts; fall back to name from filename
     scored_payloads = []
