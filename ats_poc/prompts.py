@@ -867,8 +867,10 @@ BASE_CRITERIA_JSON fields:
 - "red_flags": HR risk patterns with "flag" and "risk_type".
 - "role_context": org stage, seniority, archetype.
 
-RECRUITER PARAMETERS — ALL ITERATIONS (every include and exclude added so far):
+RECRUITER PARAMETERS — ALL ITERATIONS (every instruction added so far):
 {{EXTRA_PARAMS_HISTORY}}
+
+Each parameter entry may contain any combination of: "include" (relax a check), "exclude" (tighten a check), "update_baseline" (change hard filters), "update_p0" (change scoring weights), or a free-form "instructions" field containing a plain-language directive. When "instructions" is present, interpret it holistically — it may affect baseline_checks, p0_weights, include/exclude logic, or any combination. Treat it as the recruiter's authoritative intent for that iteration.
 
 CANDIDATE FEEDBACK — ALL ITERATIONS (every manual override and disagreement):
 {{CANDIDATE_FEEDBACK_JSON}}
@@ -1284,4 +1286,162 @@ Rules:
      'owned feature but no evidence of external users does not pass'."
    If a feedback entry has no reason provided, derive the lesson from the action and
    the candidate's preview scores alone. Do not leave lesson or rubric_change blank.
+""".strip()
+
+
+# ── CALL_PARSE: Gemini-powered resume → structured JSON ───────────────────────
+# Replaces the regex/heuristic parser for richer field extraction.
+# Called once per resume at upload time. Temperature 0 for determinism.
+
+CALL_PARSE_SYSTEM = (
+    "You are a precise resume data extractor. "
+    "Your only job is to convert raw resume text into a structured JSON object. "
+    "Extract every fact that is explicitly stated — do not infer, embellish, or hallucinate. "
+    "If a field is not present in the resume, return null or an empty array. "
+    "For work experience, compute duration_months from start/end dates if present; "
+    "if only years are given, treat each year as 12 months. "
+    "For total_experience_years, sum all non-overlapping work durations and round to 1 decimal. "
+    "For career_gaps_months, return a list of gap lengths (in months) between consecutive jobs "
+    "where the gap is 3+ months; return [] if no significant gaps exist. "
+    "Classify each work experience type as one of: product, service, freelance, startup, academic, or other."
+)
+
+CALL_PARSE_TEMPLATE = """
+Extract the following structured information from the resume text below.
+
+RESUME TEXT:
+{{RAW_TEXT}}
+
+Return ONLY a JSON object with this exact schema. Do not include any explanation.
+
+{
+  "name": "Full name as it appears on the resume, or null",
+  "email": "Email address or null",
+  "phone": "Phone number as a string or null",
+  "location": "City, State/Country or null",
+  "linkedin_url": "LinkedIn profile URL or null",
+  "github_url": "GitHub profile URL or null",
+  "total_experience_years": 0.0,
+  "career_gaps_months": [],
+  "education": [
+    {
+      "degree": "Full degree name (e.g. B.Tech in Computer Science)",
+      "institution": "University or college name",
+      "year": "Graduation year as string (YYYY) or null"
+    }
+  ],
+  "work_experience": [
+    {
+      "company": "Company name",
+      "role": "Job title",
+      "duration_months": 0,
+      "type": "product | service | freelance | startup | academic | other",
+      "description": "Key responsibilities and achievements in 2-4 sentences. Focus on ownership, impact, scale, and technologies used."
+    }
+  ],
+  "skills": ["skill1", "skill2"],
+  "certifications": ["cert1"],
+  "projects": ["project description 1"],
+  "publications": ["publication 1"]
+}
+
+Rules:
+- work_experience entries must be in reverse chronological order (most recent first)
+- description for each role: extract ownership signals (led, owned, built, shipped), impact metrics (users, revenue, latency), and tech stack. Max 400 characters.
+- skills: extract programming languages, frameworks, tools, and platforms. No soft skills.
+- If the resume is a scanned image with no readable text, return {"name": null, "email": null, "phone": null, "location": null, "linkedin_url": null, "github_url": null, "total_experience_years": 0, "career_gaps_months": [], "education": [], "work_experience": [], "skills": [], "certifications": [], "projects": [], "publications": []}
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# CALL_FIELDS — micro-call to identify minimum required resume fields
+# ---------------------------------------------------------------------------
+
+CALL_FIELDS_SYSTEM = (
+    "You are a resume data analyst. Given a JSON scoring rubric, identify the minimum set of "
+    "resume fields that are actually needed to evaluate the rubric's checks and signals. "
+    "Return ONLY a JSON object with a 'required_fields' key containing an array of field names. "
+    "Only use field names from the allowed set provided in the prompt."
+)
+
+CALL_FIELDS_TEMPLATE = """
+Given the scoring rubric below, identify which resume fields are actually needed to evaluate it.
+
+SCORING RUBRIC:
+{{SCORING_RUBRIC_JSON}}
+
+Return ONLY a JSON object with this exact schema:
+{
+  "required_fields": ["field1", "field2", ...]
+}
+
+You MUST only use values from this allowed set:
+["name", "education", "work_experience", "skills", "certifications", "projects",
+ "publications", "github_url", "linkedin_url", "location",
+ "total_experience_years", "career_gaps_months"]
+
+Include a field only if the rubric explicitly checks something about it (e.g. years of experience → total_experience_years and work_experience; college tier → education; specific skills → skills).
+Always include "name", "work_experience", and "total_experience_years".
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# CALL_EXEMPLAR — reverse-engineer a rubric from exemplar resumes
+# ---------------------------------------------------------------------------
+
+CALL_EXEMPLAR_SYSTEM = (
+    "You are a senior hiring analyst. You will be given a job description and a set of resumes "
+    "that the recruiter has marked as ideal candidates. Your task is to reverse-engineer a "
+    "scoring rubric that explains what makes these candidates stand out for this role. "
+    "Study the patterns across all exemplar resumes — what they share in background, skills, "
+    "trajectory, and ownership signals — and produce a rubric that would reliably identify "
+    "similar candidates from a larger pool. "
+    "Return ONLY a JSON object matching the exact schema specified."
+)
+
+CALL_EXEMPLAR_TEMPLATE = """
+JOB DESCRIPTION:
+{{JD_TEXT}}
+
+EXEMPLAR RESUMES ({{EXEMPLAR_COUNT}} ideal candidates selected by the recruiter):
+{{EXEMPLAR_RESUMES_JSON}}
+
+Analyze these exemplar resumes and reverse-engineer a rubric that captures what makes them stand out.
+
+Return ONLY a JSON object with this exact schema (same as a standard rubric output):
+{
+  "scoring_rubric": {
+    "baseline_checks": [
+      {
+        "check": "Declarative statement of what must be true about the candidate",
+        "required_resume_field": "work_experience | education | skills | certifications | projects | total_experience_years | location",
+        "reject_if_missing": true
+      }
+    ],
+    "p0_weights": [
+      {
+        "signal": "Declarative statement of what distinguishes a top candidate",
+        "weight": 15,
+        "required_resume_field": "work_experience | skills | certifications | projects | education"
+      }
+    ],
+    "red_flag_checks": [
+      {
+        "flag": "Describe a pattern seen in weak or rejected candidates",
+        "auto_reject": false
+      }
+    ]
+  },
+  "required_resume_fields": ["name", "work_experience", "education", "skills"],
+  "final_evaluation_prompt": "2-3 sentence summary of what this role requires and how to weigh candidates",
+  "screening_summary": "1-2 sentence plain-English summary of the ideal candidate profile derived from exemplars",
+  "synthesis_notes": "Brief explanation of what the exemplars share and what patterns drove the rubric"
+}
+
+Rules:
+- baseline_checks: 3-6 checks derived from what ALL exemplars have in common
+- p0_weights: 3-8 signals derived from what makes the best exemplars stand out; weights must sum to ~100
+- red_flag_checks: 1-3 patterns the exemplars notably do NOT have
+- Be specific — reference actual patterns from the exemplar resumes, not generic criteria
+- The rubric should be stricter than a JD-only rubric since you have ground truth examples
 """.strip()

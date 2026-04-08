@@ -21,6 +21,7 @@ class SessionOut(BaseModel):
     candidate_feedback_history: Any
     preview_field_results: Optional[Any]
     full_results: Optional[Any]
+    full_eval_progress: Optional[Any] = None
     token_totals: Any
 
     model_config = {"from_attributes": True}
@@ -34,8 +35,17 @@ class ResumeOut(BaseModel):
     quality: Any
     keyword_score: float
     resume_lens: Optional[Any] = None
+    is_exemplar: bool = False
 
     model_config = {"from_attributes": True}
+
+
+class MarkExemplarRequest(BaseModel):
+    is_exemplar: bool
+
+
+class RubricFromExemplarsRequest(BaseModel):
+    api_key: Optional[str] = None
 
 
 class AnalyzeJDRequest(BaseModel):
@@ -53,6 +63,7 @@ class CandidateFeedback(BaseModel):
     reason: str
 
 class RefineRequest(BaseModel):
+    instructions: str = ""
     include: str = ""
     exclude: str = ""
     update_baseline: str = ""

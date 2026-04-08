@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, String, Integer, Text, DateTime, JSON, Float, LargeBinary
+from sqlalchemy import Boolean, Column, String, Integer, Text, DateTime, JSON, Float, LargeBinary
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
@@ -24,6 +24,7 @@ class Session(Base):
     preview_field_results = Column(JSON, nullable=True)
     preview_seen_files = Column(JSON, default=list)
     full_results = Column(JSON, nullable=True)
+    full_eval_progress = Column(JSON, nullable=True)
     token_totals = Column(JSON, default=dict)
 
 
@@ -39,6 +40,7 @@ class Resume(Base):
     keyword_score = Column(Float, default=0.0)
     resume_lens = Column(JSON, nullable=True)
     pdf_bytes = Column(LargeBinary, nullable=True)
+    is_exemplar = Column(Boolean, default=False, nullable=False, server_default="false")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

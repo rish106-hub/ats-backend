@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import copy
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session as DBSession
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.models import PreviewIteration, Resume, Session
 from app.schemas import (
     AcceptRequest,
     AnalyzeJDRequest,
+    MarkExemplarRequest,
     RefineRequest,
     ResumeDetailOut,
     ResumeOut,
+    RubricFromExemplarsRequest,
     SessionOut,
     StartPreviewRequest,
 )
@@ -27,6 +30,10 @@ from ats_poc.prompts import (
     CALL_2_TEMPLATE,
     CALL_3_SYSTEM,
     CALL_3_TEMPLATE,
+    CALL_EXEMPLAR_SYSTEM,
+    CALL_EXEMPLAR_TEMPLATE,
+    CALL_FIELDS_SYSTEM,
+    CALL_FIELDS_TEMPLATE,
     CALL_LENS_SYSTEM,
     CALL_LENS_TEMPLATE,
     CALL_PREVIEW_SYSTEM,
@@ -54,12 +61,22 @@ LENS_BATCH_SIZE = 6
 # All readable resumes are evaluated — there is no total cap.
 # Each sub-batch is small enough that Gemini reliably returns every candidate.
 CALL_3_BATCH_SIZE = 1
+# Number of CALL_3 Gemini calls to run concurrently in the background worker.
+# Each call still sends only 1 resume (CALL_3_BATCH_SIZE=1) to prevent model drops.
+# Concurrency multiplies throughput: 5 workers × 1 resume/call × 8s/call ≈ 8s per 5 resumes.
+CALL_3_CONCURRENCY = 5
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
 _ALLOWED_FEEDBACK_ACTIONS = {"approve", "reject", "disagree", "strong_yes", "strong_no", "unclear"}
 _RESULT_CLASSIFICATIONS = {"P0", "Baseline", "Reject"}
+_ALLOWED_RESUME_FIELDS = frozenset({
+    "name", "education", "work_experience", "skills", "certifications", "projects",
+    "publications", "github_url", "linkedin_url", "location",
+    "total_experience_years", "career_gaps_months",
+})
+
 
 def _resolve_key(request_key: Optional[str]) -> str:
     key = request_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -276,7 +293,13 @@ def _normalize_scoring_output(
             )
         )
 
-    normalized_results.sort(key=lambda r: r.get("overall_score", 0), reverse=True)
+    # Sort: classification tier first (P0 → Baseline → Reject), then score within tier.
+    # This guarantees P0 candidates are always shown at the top regardless of score
+    # overlap between tiers (e.g. a Baseline at 69 never buries a P0 at 70).
+    _TIER_ORDER = {"P0": 0, "Baseline": 1, "Reject": 2}
+    normalized_results.sort(
+        key=lambda r: (_TIER_ORDER.get(r.get("classification", "Reject"), 2), -r.get("overall_score", 0))
+    )
     normalized = {
         "results": normalized_results,
         "summary": _summarize_results(normalized_results, include_low_confidence=include_confidence),
@@ -460,14 +483,41 @@ async def upload_resumes(
 ):
     row = _get_session_or_404(session_id, db)
 
+    # Initialise Gemini client if an API key is provided so parse_resume_with_gemini()
+    # can make calls. Safe to call even if api_key is None — it's a no-op.
+    if api_key:
+        configure_genai(api_key=api_key)
+
     # delete previous resumes for this session
     db.query(Resume).filter(Resume.session_id == session_id).delete()
     _reset_session_evaluation_state(row)
 
+    import hashlib
+    seen_names: set[str] = set()
+    seen_hashes: set[str] = set()
+    skipped: list[dict] = []
+
     for f in files:
         pdf_bytes = await f.read()
+
+        # Dedup by file_name (case-insensitive) and by content hash.
+        name_key = (f.filename or "").strip().lower()
+        content_hash = hashlib.sha256(pdf_bytes).hexdigest() if pdf_bytes else ""
+        if name_key and name_key in seen_names:
+            skipped.append({"file_name": f.filename, "reason": "duplicate filename"})
+            continue
+        if content_hash and content_hash in seen_hashes:
+            skipped.append({"file_name": f.filename, "reason": "duplicate content"})
+            continue
+        seen_names.add(name_key)
+        if content_hash:
+            seen_hashes.add(content_hash)
+
         try:
-            parsed = parse_resume_pdf(f.filename, pdf_bytes)
+            # Use Gemini-powered JSON extraction when an API key is available.
+            # Falls back to local regex parser on any Gemini error.
+            use_gemini = bool(api_key)
+            parsed = parse_resume_pdf(f.filename, pdf_bytes, gemini_parse=use_gemini)
         except Exception as exc:
             parsed = {
                 "file_name": f.filename,
@@ -485,6 +535,9 @@ async def upload_resumes(
             pdf_bytes=pdf_bytes,
         )
         db.add(resume_row)
+
+    if skipped:
+        print(f"[UPLOAD] Skipped {len(skipped)} duplicate resume(s): {skipped}")
 
     db.commit()
     db.refresh(row)
@@ -656,28 +709,66 @@ def _run_resume_enrichment(row: Session, resumes: list[Resume], db: DBSession) -
             item.get("file_name", "") for item in lens_list if isinstance(item, dict)
         }
         dropped = [r.file_name for r in batch if r.file_name not in returned_names]
+        lens_by_file = {item["file_name"]: item for item in lens_list if isinstance(item, dict)}
+
+        # Retry each dropped resume individually once before falling back to compress_resume.
+        # Per-resume isolation dramatically reduces the drop rate — batches lose candidates
+        # far more often than single-resume calls.
         if dropped:
             print(
                 f"[LENS DROP WARNING] Sent {len(batch)} resume(s), received {len(lens_list)}. "
-                f"Dropped (will use compress_resume fallback): {dropped}"
+                f"Retrying {len(dropped)} individually: {dropped}"
             )
+            for r in batch:
+                if r.file_name not in dropped:
+                    continue
+                try:
+                    single_block = (
+                        f"=== CANDIDATE START: {r.file_name} ===\n"
+                        f"{r.raw_text or ''}\n"
+                        f"=== CANDIDATE END: {r.file_name} ==="
+                    )
+                    retry_parsed, _rraw, retry_usage, _rp = run_structured_call(
+                        model_name=MODEL_NAME,
+                        system_instruction=CALL_LENS_SYSTEM,
+                        template=CALL_LENS_TEMPLATE,
+                        replacements={
+                            "ROLE_TYPE": jd.get("role_type", "unknown"),
+                            "ROLE_CONTEXT": jd.get("role_context", {}),
+                            "ONE_LINER": jd.get("one_liner", ""),
+                            "BASELINE_SIGNALS": baseline_signals,
+                            "P0_SIGNALS": p0_signals,
+                            "GAP_ANSWERS": gap_context,
+                            "RESUMES": single_block,
+                        },
+                    )
+                    _accumulate_tokens(row, f"Lens retry {r.file_name}", retry_usage)
+                    retry_list = retry_parsed if isinstance(retry_parsed, list) else []
+                    for item in retry_list:
+                        if isinstance(item, dict) and item.get("file_name") == r.file_name:
+                            lens_by_file[r.file_name] = item
+                            print(f"[LENS RETRY SUCCESS] {r.file_name}")
+                            break
+                except Exception as exc:
+                    print(f"[LENS RETRY FAIL] {r.file_name}: {exc}")
 
-        lens_by_file = {item["file_name"]: item for item in lens_list if isinstance(item, dict)}
+
         for r in batch:
             lens = lens_by_file.get(r.file_name)
-            if lens:
-                if _validate_lens(lens):
-                    r.resume_lens = lens
-                    print(f"[LENS SUCCESS] {r.file_name} — lens validated and stored")
-                else:
-                    print(
-                        f"[LENS VALIDATION FAILED] {r.file_name} — one or more fields are empty "
-                        f"or filler. Storing None; scoring will fall back to compress_resume()."
-                    )
-                    r.resume_lens = None
+            if lens and _validate_lens(lens):
+                r.resume_lens = lens
+                print(f"[LENS SUCCESS] {r.file_name} — lens validated and stored")
             else:
-                print(f"[LENS DROP] {r.file_name} — not returned by model. Scoring will fall back to compress_resume().")
+                # Mark as degraded so the frontend can flag this candidate —
+                # scoring still runs via compress_resume() fallback.
+                quality = dict(r.quality or {})
+                quality["lens_degraded"] = True
+                r.quality = quality
                 r.resume_lens = None
+                print(
+                    f"[LENS DEGRADED] {r.file_name} — no valid lens after retry. "
+                    f"Scoring will fall back to compress_resume()."
+                )
             db.add(r)
 
     db.flush()
@@ -730,7 +821,11 @@ def _pick_preview_batch(row: Session, db: DBSession) -> list[dict]:
         for r in all_resumes
         if (r.quality or {}).get("text_extractable", (r.quality or {}).get("readable"))
     ]
-    seen: set[str] = set(row.preview_seen_files or [])
+    # Prune seen_files of any filenames that no longer exist in the session
+    # (e.g. deleted or replaced on a new upload). Keeps the seen set in sync
+    # with the current resume set so new uploads are eligible immediately.
+    readable_files = {r["file_name"] for r in readable}
+    seen: set[str] = {f for f in (row.preview_seen_files or []) if f in readable_files}
     unseen = [r for r in readable if r["file_name"] not in seen]
 
     if not unseen:
@@ -768,6 +863,39 @@ def _run_silent_call2(row: Session) -> dict:
     _validate_synthesized_config(normalized, label="CALL_2")
     row.synthesized_config = normalized
     return normalized
+
+
+def _run_field_selection(row: Session, db: DBSession) -> None:
+    """CALL_FIELDS micro-call: identify minimum required resume fields from the rubric.
+
+    Non-fatal — if it fails, the rubric's own required_resume_fields are kept.
+    Merges output with _VERIFIABLE_FACT_FIELDS to ensure scoring always has
+    the threshold fields it needs.
+    """
+    from ats_poc.sample_selection import _VERIFIABLE_FACT_FIELDS
+    rubric = (row.synthesized_config or {}).get("scoring_rubric")
+    if not rubric:
+        return
+    try:
+        parsed, _raw, usage, _prompt = run_structured_call(
+            model_name=MODEL_NAME,
+            system_instruction=CALL_FIELDS_SYSTEM,
+            template=CALL_FIELDS_TEMPLATE,
+            replacements={"SCORING_RUBRIC_JSON": rubric},
+        )
+        _accumulate_tokens(row, "Call Fields", usage)
+        raw_fields = parsed.get("required_fields", []) if isinstance(parsed, dict) else []
+        filtered = [f for f in raw_fields if isinstance(f, str) and f in _ALLOWED_RESUME_FIELDS]
+        # Always include verifiable fact fields
+        merged = list(dict.fromkeys(
+            ["name"] + filtered + [f for f in _VERIFIABLE_FACT_FIELDS if f in _ALLOWED_RESUME_FIELDS]
+        ))
+        synth = dict(row.synthesized_config)
+        synth["required_resume_fields"] = merged
+        row.synthesized_config = synth
+        print(f"[CALL_FIELDS] Required fields selected: {merged}")
+    except Exception as exc:
+        print(f"[CALL_FIELDS] Non-fatal error — keeping existing fields: {exc}")
 
 
 def _validate_synthesized_config(parsed: dict, label: str) -> None:
@@ -944,6 +1072,40 @@ def _build_scoring_criteria(row: Session) -> dict:
             if isinstance(existing, list):
                 base[key] = [_coerce_str(item) for item in existing if item]
 
+    # Add an explicit structured checklist at the top level so the scoring model
+    # can't miss any criterion. The model MUST check every item in this list:
+    # - hard_baseline_checks: every item here is a REJECTION if not met
+    # - p0_weighted_signals: every item here contributes to the P0 score
+    # This is IN ADDITION to the text-based baseline_signals/p0_signals arrays above,
+    # giving the model two representations of the same data — belt AND suspenders.
+    if baseline_checks:
+        base["_hard_baseline_checklist"] = [
+            {
+                "check": _coerce_str(c.get("check")),
+                "check_against_field": c.get("resume_field", "work_experience"),
+                "reject_if_missing": c.get("reject_if_missing", True),
+                "instruction": (
+                    "HARD REJECT if not satisfied — set baseline_pass: false"
+                    if c.get("reject_if_missing", True)
+                    else "SOFT preference — do NOT reject, only lower p0_score slightly"
+                ),
+            }
+            for c in baseline_checks
+            if isinstance(c, dict) and _coerce_str(c.get("check"))
+        ]
+
+    if p0_weights:
+        base["_p0_weighted_checklist"] = [
+            {
+                "signal": _coerce_str(w.get("signal")),
+                "weight": w.get("weight", 0),
+                "check_against_field": w.get("resume_field", "work_experience"),
+                "instruction": f"Contributes {w.get('weight', 0)} points to p0_score if clearly evidenced.",
+            }
+            for w in p0_weights
+            if isinstance(w, dict) and _coerce_str(w.get("signal"))
+        ]
+
     hard_count = len(base.get("baseline_signals", []))
     soft_count = len(soft_signals)
     print(
@@ -989,6 +1151,17 @@ def _run_preview_scoring(row: Session, batch: list[dict]) -> dict:
         include_extra_param_matches=True,
         include_confidence=False,
     )
+    # Stamp server-known file_name on each result so downstream carryover logic
+    # can do O(1) lookups without fuzzy name matching.
+    name_to_file = {
+        (p.get("name") or "").strip().lower(): b["file_name"]
+        for p, b in zip(payloads, batch)
+    }
+    for item in normalized.get("results", []):
+        cname = (item.get("candidate_name") or "").strip().lower()
+        fn = name_to_file.get(cname)
+        if fn:
+            item["file_name"] = fn
     _accumulate_tokens(row, "Preview Score", usage)
     row.preview_field_results = normalized
     return normalized
@@ -1001,13 +1174,27 @@ def start_preview(session_id: str, body: StartPreviewRequest, db: DBSession = De
 
     try:
         if row.synthesized_config is None:
-            all_resumes = db.query(Resume).filter(Resume.session_id == str(row.id)).all()
-            _run_resume_enrichment(row, all_resumes, db)
+            # Lazy lens: do NOT enrich every uploaded resume upfront.
+            # _run_silent_call2 only needs base_criteria; lenses are only required
+            # for the resumes actually being scored, and are generated below.
             _run_silent_call2(row)
+            _run_field_selection(row, db)
 
         batch = _pick_preview_batch(row, db)
         if not batch:
             raise HTTPException(status_code=400, detail="No readable resumes found in this session.")
+
+        # Lazy enrichment — lens only the 2 resumes about to be scored.
+        batch_files = [b["file_name"] for b in batch]
+        batch_rows = (
+            db.query(Resume)
+            .filter(Resume.session_id == str(row.id), Resume.file_name.in_(batch_files))
+            .all()
+        )
+        _run_resume_enrichment(row, batch_rows, db)
+        lens_by_file = {r.file_name: r.resume_lens for r in batch_rows}
+        for b in batch:
+            b["resume_lens"] = lens_by_file.get(b["file_name"])
 
         results = _run_preview_scoring(row, batch)
     except GeminiUnavailableError as exc:
@@ -1034,18 +1221,21 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
     configure_genai(api_key=_resolve_key(body.api_key))
 
     has_params = any([
+        body.instructions.strip(),
         body.include.strip(), body.exclude.strip(),
         body.update_baseline.strip(), body.update_p0.strip(),
     ])
     if has_params:
         history = list(row.extra_params_history or [])
-        history.append({
-            "iteration": row.preview_iteration_count,
-            "include": body.include.strip(),
-            "exclude": body.exclude.strip(),
-            "update_baseline": body.update_baseline.strip(),
-            "update_p0": body.update_p0.strip(),
-        })
+        entry: dict = {"iteration": row.preview_iteration_count}
+        if body.instructions.strip():
+            entry["instructions"] = body.instructions.strip()
+        else:
+            entry["include"] = body.include.strip()
+            entry["exclude"] = body.exclude.strip()
+            entry["update_baseline"] = body.update_baseline.strip()
+            entry["update_p0"] = body.update_p0.strip()
+        history.append(entry)
         row.extra_params_history = history
 
     feedback_dicts = [fb.model_dump() for fb in body.candidate_feedback] if body.candidate_feedback else []
@@ -1062,30 +1252,29 @@ def refine_preview(session_id: str, body: RefineRequest, db: DBSession = Depends
         if not batch:
             raise HTTPException(status_code=400, detail="No readable resumes found.")
 
-        # Invalidate lenses for the current batch so they are re-generated against
-        # the UPDATED synthesized criteria. Without this, the lens reflects the old
-        # rubric priorities and the scoring model reads stale context — criteria
-        # changes and disagree feedback appear to have no effect on scores.
         batch_files = {r["file_name"] for r in batch}
         # Ensure every file_name that feedback was given on is in the rescoring batch,
         # even if it fell out of the displayed preview. Otherwise disagree feedback has
         # no visible effect because the candidate is never re-scored.
-        for fb in feedback_dicts:
-            fn = fb.get("file_name")
-            if fn:
-                batch_files.add(fn)
+        feedback_files = {fb.get("file_name") for fb in feedback_dicts if fb.get("file_name")}
+        batch_files.update(feedback_files)
 
         batch_resumes = (
             db.query(Resume)
             .filter(Resume.session_id == str(row.id), Resume.file_name.in_(batch_files))
             .all()
         )
+        # Only invalidate lenses for resumes the recruiter gave feedback on.
+        # Preserving the other lenses eliminates prose-drift variance across
+        # re-evaluate clicks — the rest of the batch sees stable context and
+        # any score change is purely due to the rubric update.
         for r in batch_resumes:
-            r.resume_lens = None
-            db.add(r)
+            if r.file_name in feedback_files:
+                r.resume_lens = None
+                db.add(r)
         db.flush()
 
-        # Re-enrich — now uses synthesized criteria signals via _current_criteria_signals
+        # Enrich any resume that still has no lens (new-to-batch or just-invalidated).
         _run_resume_enrichment(row, batch_resumes, db)
 
         # Rebuild the batch dict list from the refreshed DB rows so it includes both
@@ -1224,21 +1413,368 @@ def _annotate_rubric_for_call3(rubric: dict) -> dict:
         if (hard or soft)
         else "All baseline_checks are hard filters."
     )
+
+    # Structured checklist so CALL_3 knows exactly which resume_field to look at
+    # for each check and whether it is a HARD REJECT or a soft preference.
+    annotated["_must_check_every_item"] = [
+        {
+            "check": _coerce_str(c.get("check")),
+            "look_at_field": c.get("resume_field", "work_experience"),
+            "verdict_if_missing": "REJECT — set baseline_pass: false" if c.get("reject_if_missing", True) else "SOFT — do NOT reject",
+        }
+        for c in baseline_checks
+        if isinstance(c, dict) and _coerce_str(c.get("check"))
+    ]
+
+    # Explicit P0 scoring guide so every signal is evaluated against the right field
+    p0_weights = rubric.get("p0_weights") or []
+    annotated["_p0_scoring_guide"] = [
+        {
+            "signal": _coerce_str(w.get("signal")),
+            "look_at_field": w.get("resume_field", "work_experience"),
+            "max_points": w.get("weight", 0),
+        }
+        for w in p0_weights
+        if isinstance(w, dict) and _coerce_str(w.get("signal"))
+    ]
+
     return annotated
 
 
 # ── step 4: accept + full evaluation ──────────────────────────────────────
 
-@router.post("/sessions/{session_id}/accept", response_model=SessionOut)
-def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = Depends(get_db)):
+def _build_carryover_map(readable: list[Resume], preview_items: list[Any]) -> dict[str, dict]:
+    """Resolve preview results → {file_name: result}, using stamped file_name
+    first and falling back to legacy fuzzy name matching."""
+    out: dict[str, dict] = {}
+    readable_files = {r.file_name for r in readable}
+    legacy: dict[str, str] | None = None
+    for item in preview_items:
+        if not isinstance(item, dict):
+            continue
+        fname = item.get("file_name")
+        if fname and fname in readable_files:
+            out[fname] = item
+            continue
+        if legacy is None:
+            legacy = {}
+            for r in readable:
+                nm = ((r.resume_json or {}).get("name") or "").strip().lower()
+                stem = r.file_name.replace(".pdf", "").replace("_", " ").replace("-", " ").strip().lower()
+                if nm:
+                    legacy[nm] = r.file_name
+                legacy[stem] = r.file_name
+                legacy[r.file_name.lower()] = r.file_name
+        resolved = legacy.get((item.get("candidate_name") or "").strip().lower())
+        if resolved:
+            out[resolved] = item
+    return out
+
+
+def _is_resume_extractable(r: Resume) -> bool:
+    q = r.quality or {}
+    if "text_extractable" in q:
+        return bool(q["text_extractable"])
+    return bool(q.get("readable"))
+
+
+def _run_full_eval_worker(session_id: str, api_key: str) -> None:
+    """Background worker: scores every needs-scoring resume one at a time,
+    checkpointing full_results and full_eval_progress after each resume so a
+    crash or timeout never loses scored work. Safe to resume — skips any
+    file_name already present in full_results.
+    """
+    db = SessionLocal()
+    try:
+        configure_genai(api_key=api_key)
+        row = db.query(Session).filter(Session.id == session_id).first()
+        if not row:
+            return
+
+        config = row.final_config or row.synthesized_config or row.base_criteria or {}
+        required_fields = config.get("required_resume_fields", [])
+        raw_rubric = config.get("scoring_rubric", {})
+        prompt_text = config.get("final_evaluation_prompt", "")
+        rubric = _annotate_rubric_for_call3(raw_rubric)
+
+        all_resumes = db.query(Resume).filter(Resume.session_id == session_id).all()
+        readable = [r for r in all_resumes if _is_resume_extractable(r)]
+        unreadable = [r for r in all_resumes if not _is_resume_extractable(r)]
+
+        preview_items = []
+        if isinstance(row.preview_field_results, dict):
+            preview_items = row.preview_field_results.get("results") or []
+        preview_results_by_file = _build_carryover_map(readable, preview_items)
+
+        # Checkpoint: resume from any already-scored results in full_results
+        existing_results: list[dict] = []
+        if isinstance(row.full_results, dict):
+            for item in (row.full_results.get("results") or []):
+                if isinstance(item, dict):
+                    existing_results.append(item)
+        existing_files = {item.get("file_name") for item in existing_results if item.get("file_name")}
+
+        # Attach preview carryover once
+        for fname, p_item in preview_results_by_file.items():
+            if fname in existing_files:
+                continue
+            carried = dict(p_item)
+            carried["_source"] = "preview_carryover"
+            carried["file_name"] = fname
+            existing_results.append(carried)
+            existing_files.add(fname)
+
+        needs_scoring = [r for r in readable if r.file_name not in existing_files]
+        total = len(readable)
+
+        row.full_eval_progress = {
+            "status": "running",
+            "scored": len(existing_results),
+            "total": total,
+            "error": None,
+        }
+        db.commit()
+
+        # Lazy lens for needs_scoring only — invalidate so they align with final rubric
+        for r in needs_scoring:
+            r.resume_lens = None
+            db.add(r)
+        db.flush()
+        _run_resume_enrichment(row, needs_scoring, db)
+        db.commit()
+        # Reload to pick up fresh lenses
+        refreshed = {
+            r.file_name: r
+            for r in db.query(Resume).filter(Resume.session_id == session_id).all()
+        }
+        needs_scoring = [refreshed[r.file_name] for r in needs_scoring if r.file_name in refreshed]
+
+        model_dropped: list[dict] = []
+        pending_token_usage: list[tuple[str, dict]] = []
+
+        def _score_one_worker(payload: dict, label: str, file_name: str) -> dict:
+            """Thread worker: score one resume, return result bundle.
+
+            Returns a dict with keys: file_name, results (list), usage, label, dropped (bool).
+            Does NOT touch the DB or shared state — safe to run concurrently.
+            """
+            try:
+                parsed, _raw, usage, _prompt = run_structured_call(
+                    model_name=MODEL_NAME,
+                    system_instruction=CALL_3_SYSTEM,
+                    template=CALL_3_TEMPLATE,
+                    replacements={
+                        "FINAL_EVALUATION_PROMPT": prompt_text,
+                        "SCORING_RUBRIC_JSON": rubric,
+                        "CANDIDATES_JSON": [payload],
+                    },
+                )
+                results = parsed.get("results", []) if isinstance(parsed, dict) else []
+            except Exception as exc:
+                print(f"[CALL_3 ERROR] {file_name}: {exc}")
+                results = []
+                usage = {}
+
+            sent_name = (payload.get("name") or "").strip().lower()
+            returned = {(x.get("candidate_name") or "").strip().lower() for x in results if isinstance(x, dict)}
+
+            if sent_name not in returned:
+                # One in-thread retry for dropped candidate
+                try:
+                    retry_parsed, _rraw, retry_usage, _rp = run_structured_call(
+                        model_name=MODEL_NAME,
+                        system_instruction=CALL_3_SYSTEM,
+                        template=CALL_3_TEMPLATE,
+                        replacements={
+                            "FINAL_EVALUATION_PROMPT": prompt_text,
+                            "SCORING_RUBRIC_JSON": rubric,
+                            "CANDIDATES_JSON": [payload],
+                        },
+                    )
+                    retry_results = retry_parsed.get("results", []) if isinstance(retry_parsed, dict) else []
+                    retry_returned = {(x.get("candidate_name") or "").strip().lower() for x in retry_results if isinstance(x, dict)}
+                    if sent_name in retry_returned:
+                        results = retry_results
+                        usage = retry_usage
+                        returned = retry_returned
+                        print(f"[CALL_3 RETRY SUCCESS] {file_name}")
+                    else:
+                        print(f"[CALL_3 RETRY FAIL] {file_name}: still missing after retry")
+                except Exception as exc:
+                    print(f"[CALL_3 RETRY FAIL] {file_name}: {exc}")
+
+            dropped = sent_name not in {(x.get("candidate_name") or "").strip().lower() for x in results if isinstance(x, dict)}
+            for item in results:
+                if isinstance(item, dict):
+                    item["file_name"] = file_name
+
+            return {"file_name": file_name, "results": results, "usage": usage, "label": label, "dropped": dropped}
+
+        # ── Parallel CALL_3 ───────────────────────────────────────────────────
+        # Process CALL_3_CONCURRENCY resumes simultaneously. Each thread scores
+        # 1 resume (keeps reliability), but N threads run in parallel — cutting
+        # wall-clock time from ~80 min to ~80/N min for 600 resumes.
+        chunk_start = 1
+        for chunk_start_idx in range(0, len(needs_scoring), CALL_3_CONCURRENCY):
+            chunk = needs_scoring[chunk_start_idx : chunk_start_idx + CALL_3_CONCURRENCY]
+
+            # Build payloads for this chunk on the main thread (DB access)
+            chunk_jobs: list[tuple[dict, str, str]] = []  # (payload, label, file_name)
+            for offset, r in enumerate(chunk):
+                global_idx = chunk_start_idx + offset + 1
+                payload = build_scored_resume_payload(r.resume_json, r.resume_lens, required_fields)
+                if not payload.get("name"):
+                    payload["name"] = r.file_name.replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
+                label = f"Call 3 #{global_idx}"
+                chunk_jobs.append((payload, label, r.file_name))
+
+            print(f"[FULL EVAL] Scoring chunk {chunk_start_idx + 1}–{chunk_start_idx + len(chunk)} "
+                  f"of {len(needs_scoring)} ({CALL_3_CONCURRENCY} concurrent workers)")
+
+            # Fire all calls in the chunk concurrently
+            with ThreadPoolExecutor(max_workers=CALL_3_CONCURRENCY) as executor:
+                futures = {
+                    executor.submit(_score_one_worker, payload, label, file_name): file_name
+                    for payload, label, file_name in chunk_jobs
+                }
+                chunk_bundle: list[dict] = []
+                for future in as_completed(futures):
+                    try:
+                        bundle = future.result()
+                        chunk_bundle.append(bundle)
+                    except Exception as exc:
+                        fn = futures[future]
+                        print(f"[CALL_3 THREAD ERROR] {fn}: {exc}")
+                        chunk_bundle.append({"file_name": fn, "results": [], "usage": {}, "label": "?", "dropped": True})
+
+            # Merge chunk results on the main thread — no concurrent DB writes
+            for bundle in chunk_bundle:
+                if bundle["dropped"]:
+                    model_dropped.append({
+                        "file_name": bundle["file_name"],
+                        "reason": "Sent to the evaluation model and absent from the response even after retry.",
+                    })
+                else:
+                    existing_results.extend(bundle["results"])
+                # Accumulate tokens on main thread (no lock needed)
+                if bundle.get("usage"):
+                    _accumulate_tokens(row, bundle["label"], bundle["usage"])
+
+            # Checkpoint after each chunk — partial results survive crashes
+            name_to_file_snapshot = {
+                (x.get("candidate_name") or "").strip().lower(): x.get("file_name")
+                for x in existing_results if isinstance(x, dict)
+            }
+            normalized = _normalize_scoring_output(
+                {"results": existing_results},
+                expected_names=[
+                    (x.get("candidate_name") or "")
+                    for x in existing_results if isinstance(x, dict)
+                ],
+                include_field_matches=False,
+                include_extra_param_matches=False,
+                include_confidence=True,
+            )
+            for item in normalized.get("results", []):
+                fn = name_to_file_snapshot.get((item.get("candidate_name") or "").strip().lower())
+                if fn:
+                    item["file_name"] = fn
+            normalized["_skipped"] = {
+                "unreadable": [
+                    {
+                        "file_name": u.file_name,
+                        "reason": "No text could be extracted from this PDF — likely a scanned image or corrupt file.",
+                        "quality": u.quality or {},
+                    }
+                    for u in unreadable
+                ],
+                "sampled_out": [],
+                "model_dropped": model_dropped,
+            }
+            row.full_results = normalized
+            row.full_eval_progress = {
+                "status": "running",
+                "scored": len(existing_results),
+                "total": total,
+                "error": None,
+            }
+            db.commit()
+
+        row.full_eval_progress = {
+            "status": "completed",
+            "scored": len(existing_results),
+            "total": total,
+            "error": None,
+        }
+        row.status = "completed"
+        db.commit()
+        print(f"[FULL EVAL] Worker complete. {len(existing_results)}/{total} scored.")
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        try:
+            row = db.query(Session).filter(Session.id == session_id).first()
+            if row:
+                prog = dict(row.full_eval_progress or {})
+                prog["status"] = "error"
+                prog["error"] = str(exc)
+                row.full_eval_progress = prog
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+@router.get("/sessions/{session_id}/full-eval-status")
+def get_full_eval_status(session_id: str, db: DBSession = Depends(get_db)):
     row = _get_session_or_404(session_id, db)
-    configure_genai(api_key=_resolve_key(body.api_key))
+    results_count = 0
+    if isinstance(row.full_results, dict):
+        results_count = len(row.full_results.get("results") or [])
+    return {
+        "progress": row.full_eval_progress or {"status": "idle"},
+        "results_count": results_count,
+        "status": row.status,
+    }
+
+
+@router.post("/sessions/{session_id}/accept", response_model=SessionOut)
+def accept_and_run_full(
+    session_id: str,
+    body: AcceptRequest,
+    background_tasks: BackgroundTasks,
+    db: DBSession = Depends(get_db),
+):
+    row = _get_session_or_404(session_id, db)
+    api_key = _resolve_key(body.api_key)
+    configure_genai(api_key=api_key)
 
     try:
         if row.synthesized_config is None:
-            all_resumes = db.query(Resume).filter(Resume.session_id == str(row.id)).all()
-            _run_resume_enrichment(row, all_resumes, db)
+            # Synthesis only needs base_criteria — safe to run synchronously.
             _run_silent_call2(row)
+            _run_field_selection(row, db)
+
+        # Feedback propagation: if the recruiter submitted Disagree on any
+        # candidate and is going directly to Accept (without clicking Re-evaluate),
+        # re-run synthesis once so their feedback reaches final_config.
+        feedback_history = row.candidate_feedback_history or []
+        last_synthesis_iter = (row.synthesized_config or {}).get("_last_synthesis_iteration", -1)
+        latest_feedback_iter = max(
+            (fb.get("iteration", -1) for fb in feedback_history if isinstance(fb, dict)),
+            default=-1,
+        )
+        if latest_feedback_iter >= 0 and latest_feedback_iter != last_synthesis_iter:
+            print(
+                f"[ACCEPT] Pending feedback detected (latest iter={latest_feedback_iter}, "
+                f"last synth iter={last_synthesis_iter}). Running synthesis before full eval."
+            )
+            _run_synthesis(row, db, [])
+            synth = dict(row.synthesized_config or {})
+            synth["_last_synthesis_iteration"] = latest_feedback_iter
+            row.synthesized_config = synth
     except GeminiUnavailableError as exc:
         _raise_gemini_error(exc)
 
@@ -1246,282 +1782,114 @@ def accept_and_run_full(session_id: str, body: AcceptRequest, db: DBSession = De
     row.final_config = config
 
     all_resumes = db.query(Resume).filter(Resume.session_id == session_id).all()
-    # Gate on text_extractable (was any text pulled from the PDF?) not on readable
-    # (did our section parser find structured fields?). readable=False just means our
-    # heuristic parser missed the structure — the raw text is still usable for scoring.
-    def _is_extractable(r: Resume) -> bool:
-        q = r.quality or {}
-        # text_extractable is the new field; fall back to readable for old rows
-        if "text_extractable" in q:
-            return bool(q["text_extractable"])
-        return bool(q.get("readable"))
-
-    readable   = [r for r in all_resumes if _is_extractable(r)]
-    unreadable = [r for r in all_resumes if not _is_extractable(r)]
-
+    readable = [r for r in all_resumes if _is_resume_extractable(r)]
     if not readable:
         raise HTTPException(status_code=400, detail="No readable resumes to assess.")
 
-    print(
-        f"[FULL EVAL] Total uploaded: {len(all_resumes)}, "
-        f"readable: {len(readable)}, "
-        f"unreadable (skipped): {len(unreadable)}"
+    # If a run is already in progress, return current state (idempotent re-click).
+    progress = row.full_eval_progress or {}
+    if progress.get("status") == "running":
+        return row
+
+    # Seed progress so the frontend can show a "queued" state before the worker starts.
+    row.full_eval_progress = {
+        "status": "queued",
+        "scored": 0,
+        "total": len(readable),
+        "error": None,
+    }
+    row.status = "running_full_eval"
+    db.commit()
+    db.refresh(row)
+
+    # Kick off background worker — the rest of full evaluation (lens + CALL_3 + checkpoint)
+    # happens asynchronously so even 600 resumes never block an HTTP request.
+    background_tasks.add_task(_run_full_eval_worker, session_id, api_key)
+    return row
+
+
+# ── exemplar endpoints ─────────────────────────────────────────────────────
+
+@router.patch("/sessions/{session_id}/resumes/{file_name:path}/mark-exemplar", response_model=ResumeOut)
+def mark_exemplar(
+    session_id: str,
+    file_name: str,
+    body: MarkExemplarRequest,
+    db: DBSession = Depends(get_db),
+):
+    resume = (
+        db.query(Resume)
+        .filter(Resume.session_id == session_id, Resume.file_name == file_name)
+        .first()
     )
-    if unreadable:
-        print(f"[FULL EVAL] Skipped files: {[r.file_name for r in unreadable]}")
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found.")
+    resume.is_exemplar = body.is_exemplar
+    db.commit()
+    db.refresh(resume)
+    return resume
 
-    # Collect the set of files the recruiter already finalized in preview.
-    # Those get their preview verdict carried directly into final results —
-    # the rubric the recruiter approved was evaluated against them already,
-    # and re-scoring them would (a) waste Gemini calls and (b) risk drift.
-    preview_results_by_file: dict[str, dict] = {}
-    preview_field_results = row.preview_field_results or {}
-    preview_items = preview_field_results.get("results") or [] if isinstance(preview_field_results, dict) else []
 
-    # Map preview candidate_name → file_name via the Resume table
-    name_to_file_map: dict[str, str] = {}
-    for r in readable:
-        nm = ((r.resume_json or {}).get("name") or "").strip().lower()
-        stem = r.file_name.replace(".pdf", "").replace("_", " ").replace("-", " ").strip().lower()
-        if nm:
-            name_to_file_map[nm] = r.file_name
-        name_to_file_map[stem] = r.file_name
-        name_to_file_map[r.file_name.lower()] = r.file_name
-    for item in preview_items:
-        if not isinstance(item, dict):
-            continue
-        cname = (item.get("candidate_name") or "").strip().lower()
-        fname = name_to_file_map.get(cname)
-        if fname:
-            preview_results_by_file[fname] = item
+@router.post("/sessions/{session_id}/rubric-from-exemplars", response_model=SessionOut)
+def rubric_from_exemplars(
+    session_id: str,
+    body: RubricFromExemplarsRequest,
+    db: DBSession = Depends(get_db),
+):
+    """Generate a scoring rubric by reverse-engineering it from marked exemplar resumes.
 
-    # Split readable resumes into "already scored in preview" vs "needs scoring"
-    already_scored = [r for r in readable if r.file_name in preview_results_by_file]
-    needs_scoring  = [r for r in readable if r.file_name not in preview_results_by_file]
+    Requires at least 2 resumes marked as is_exemplar=True.
+    Falls back to standard CALL_2 path if < 2 exemplars are marked.
+    """
+    row = _get_session_or_404(session_id, db)
+    configure_genai(api_key=_resolve_key(body.api_key))
 
-    print(
-        f"[FULL EVAL] carried over from preview: {len(already_scored)}, "
-        f"to score now: {len(needs_scoring)}"
+    exemplars = (
+        db.query(Resume)
+        .filter(Resume.session_id == session_id, Resume.is_exemplar == True)  # noqa: E712
+        .all()
     )
+
+    if len(exemplars) < 2:
+        # Not enough exemplars — fall back to standard CALL_2
+        print(f"[EXEMPLAR] Only {len(exemplars)} exemplar(s) marked — falling back to CALL_2")
+        try:
+            _run_silent_call2(row)
+            _run_field_selection(row, db)
+        except GeminiUnavailableError as exc:
+            _raise_gemini_error(exc)
+        row.status = "rubric_ready"
+        db.commit()
+        db.refresh(row)
+        return row
+
+    # Build exemplar resume payloads
+    exemplar_payloads = [
+        {"file_name": r.file_name, "resume_json": r.resume_json or {}}
+        for r in exemplars
+    ]
 
     try:
-        # Invalidate lenses ONLY for the remaining (unscored) resumes and regenerate
-        # against the FINAL synthesized rubric. Previewed resumes already have lenses
-        # aligned to the rubric the recruiter approved.
-        for r in needs_scoring:
-            r.resume_lens = None
-            db.add(r)
-        db.flush()
-        _run_resume_enrichment(row, needs_scoring, db)
-
-        # Reload so fresh lenses are in memory
-        refreshed = db.query(Resume).filter(Resume.session_id == session_id).all()
-        refreshed_by_file = {r.file_name: r for r in refreshed}
-        needs_scoring = [refreshed_by_file[r.file_name] for r in needs_scoring if r.file_name in refreshed_by_file]
+        parsed, _raw, usage, _prompt = run_structured_call(
+            model_name=MODEL_NAME,
+            system_instruction=CALL_EXEMPLAR_SYSTEM,
+            template=CALL_EXEMPLAR_TEMPLATE,
+            replacements={
+                "JD_TEXT": row.jd_text or "",
+                "EXEMPLAR_RESUMES_JSON": exemplar_payloads,
+                "EXEMPLAR_COUNT": len(exemplar_payloads),
+            },
+        )
     except GeminiUnavailableError as exc:
         _raise_gemini_error(exc)
 
-    required_fields = config.get("required_resume_fields", []) if config else []
-    resume_dicts = [
-        {
-            "file_name": r.file_name,
-            "resume_json": r.resume_json,
-            "resume_lens": r.resume_lens,
-            "quality": r.quality,
-        }
-        for r in needs_scoring
-    ]
+    _accumulate_tokens(row, "Call Exemplar", usage)
+    normalized = _normalize_synthesized_config(parsed)
+    _validate_synthesized_config(normalized, label="CALL_EXEMPLAR")
+    row.synthesized_config = normalized
 
-    # Evaluate ALL readable resumes — no cap, no sampling.
-    # CALL_3 is batched internally (CALL_3_BATCH_SIZE per Gemini call) so
-    # any number of resumes is handled correctly.
-    batch = resume_dicts
-    sampled_out: list[dict] = []  # never populated — kept for _skipped shape consistency
-
-    # Build scored payloads — lens + verifiable facts; fall back to name from filename
-    scored_payloads = []
-    for r in batch:
-        payload = build_scored_resume_payload(r["resume_json"], r.get("resume_lens"), required_fields)
-        if not payload.get("name"):
-            payload["name"] = r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
-        scored_payloads.append(payload)
-
-    raw_rubric = config.get("scoring_rubric", {}) if config else {}
-    prompt_text = config.get("final_evaluation_prompt", "") if config else ""
-
-    # Annotate the rubric so CALL_3 sees which baseline checks are hard vs soft.
-    rubric = _annotate_rubric_for_call3(raw_rubric)
-
-    # Build a name → file_name lookup so dropped-candidate detection is accurate.
-    name_to_file: dict[str, str] = {}
-    expected_names: list[str] = []
-    for r in batch:
-        candidate_name = (
-            (r.get("resume_json") or {}).get("name")
-            or r["file_name"].replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
-        )
-        normalized_name = candidate_name.strip()
-        expected_names.append(normalized_name)
-        name_to_file[normalized_name.lower()] = r["file_name"]
-
-    # Also reserve slots for the preview-carryover candidates so they survive
-    # the expected-names filter in _normalize_scoring_output.
-    for file_name, preview_item in preview_results_by_file.items():
-        carry_name = (preview_item.get("candidate_name") or file_name).strip()
-        if carry_name and carry_name.lower() not in {n.lower() for n in expected_names}:
-            expected_names.append(carry_name)
-    expected_names_lower_set = {n.strip().lower() for n in expected_names}
-
-    # ── Batched CALL_3 ────────────────────────────────────────────────────────
-    # Send CALL_3_BATCH_SIZE resumes per sub-call and merge results.
-    # Sending all resumes in one call causes Gemini to silently drop candidates
-    # when the array is large. Small batches guarantee every resume comes back.
-    all_results: list[dict] = []
-    model_dropped: list[dict] = []
-
-    def _score_chunk(chunk: list[dict], batch_label: str) -> list[dict]:
-        chunk_parsed, _raw, usage, _prompt = run_structured_call(
-            model_name=MODEL_NAME,
-            system_instruction=CALL_3_SYSTEM,
-            template=CALL_3_TEMPLATE,
-            replacements={
-                "FINAL_EVALUATION_PROMPT": prompt_text,
-                "SCORING_RUBRIC_JSON": rubric,
-                "CANDIDATES_JSON": chunk,
-            },
-        )
-        _accumulate_tokens(row, batch_label, usage)
-        return chunk_parsed.get("results", []) if isinstance(chunk_parsed, dict) else []
-
-    for batch_idx in range(0, len(scored_payloads), CALL_3_BATCH_SIZE):
-        chunk = scored_payloads[batch_idx : batch_idx + CALL_3_BATCH_SIZE]
-        batch_label = f"Call 3 batch {batch_idx // CALL_3_BATCH_SIZE + 1}"
-        print(f"[FULL EVAL] {batch_label}: scoring {len(chunk)} resume(s)")
-
-        chunk_results: list[dict] = []
-        # Attempt 1 — main call
-        try:
-            chunk_results = _score_chunk(chunk, batch_label)
-        except GeminiUnavailableError as exc:
-            print(f"[CALL_3 ERROR] {batch_label} attempt 1 failed: {exc}. Retrying once...")
-        except Exception as exc:
-            print(f"[CALL_3 ERROR] {batch_label} attempt 1 crashed: {exc}. Retrying once...")
-
-        # Per-batch drop detection
-        returned_in_chunk: set[str] = {
-            r["candidate_name"].strip().lower()
-            for r in chunk_results
-            if isinstance(r, dict) and r.get("candidate_name")
-        }
-        missing_payloads = [
-            p for p in chunk
-            if (p.get("name") or "").strip().lower() not in returned_in_chunk
-        ]
-
-        # Attempt 2 — one retry for only the still-missing resumes, isolated further
-        if missing_payloads:
-            print(f"[CALL_3 RETRY] {batch_label}: retrying {len(missing_payloads)} missing resume(s)")
-            for payload in missing_payloads:
-                retry_label = f"{batch_label} retry {payload.get('name', '?')}"
-                try:
-                    retry_results = _score_chunk([payload], retry_label)
-                    chunk_results.extend(retry_results)
-                except Exception as exc:
-                    print(f"[CALL_3 RETRY FAIL] {retry_label}: {exc}")
-
-        all_results.extend(chunk_results)
-
-        # Final drop detection after retries
-        final_returned: set[str] = {
-            r["candidate_name"].strip().lower()
-            for r in chunk_results
-            if isinstance(r, dict) and r.get("candidate_name")
-        }
-        for payload in chunk:
-            sent_name = (payload.get("name") or "").strip().lower()
-            if sent_name and sent_name not in final_returned:
-                file_name = name_to_file.get(sent_name, sent_name)
-                model_dropped.append({
-                    "file_name": file_name,
-                    "reason": (
-                        "Resume was sent to the evaluation model and did not come back "
-                        "even after a retry. Re-run the full evaluation to try again."
-                    ),
-                })
-                print(f"[CALL_3 DROP] '{sent_name}' missing from {batch_label} after retry.")
-
-    if model_dropped:
-        print(
-            f"[CALL_3 DROP WARNING] {len(model_dropped)} resume(s) dropped across all batches: "
-            f"{[d['file_name'] for d in model_dropped]}"
-        )
-
-    # Carry over the already-approved preview verdicts so the recruiter's approved
-    # rubric is not re-run against resumes they already signed off on.
-    for file_name, preview_item in preview_results_by_file.items():
-        carried = dict(preview_item)
-        carried["_source"] = "preview_carryover"
-        all_results.append(carried)
-        if file_name not in expected_names_lower_set:
-            expected_names.append(preview_item.get("candidate_name", file_name))
-
-    # Reconstruct a single parsed dict from all batches with a stable shape.
-    parsed = _normalize_scoring_output(
-        {"results": all_results},
-        expected_names=expected_names,
-        include_field_matches=False,
-        include_extra_param_matches=False,
-        include_confidence=True,
-    )
-    model_dropped.extend((parsed.get("_skipped") or {}).get("model_dropped", []))
-    deduped_model_dropped: list[dict[str, str]] = []
-    seen_drop_keys: set[tuple[str, str]] = set()
-    for item in model_dropped:
-        key = (str(item.get("file_name", "")), str(item.get("reason", "")))
-        if key in seen_drop_keys:
-            continue
-        deduped_model_dropped.append(item)
-        seen_drop_keys.add(key)
-    model_dropped = deduped_model_dropped
-    print(
-        f"[FULL EVAL] Complete. {len(parsed.get('results', []))} evaluated across "
-        f"{(len(scored_payloads) + CALL_3_BATCH_SIZE - 1) // CALL_3_BATCH_SIZE} batch(es)."
-    )
-
-    # Attach skipped-resume metadata so the frontend can surface it clearly.
-    # Unreadable: PDF could not be parsed at all.
-    # Sampled out: readable but excluded because upload exceeded FULL_EVAL_BATCH_SIZE.
-    # Model dropped: sent to Gemini but absent from the structured response.
-    if isinstance(parsed, dict):
-        parsed["_skipped"] = {
-            "unreadable": [
-                {
-                    "file_name": r.file_name,
-                    "reason": "No text could be extracted from this PDF — likely a scanned image or corrupt file.",
-                    "quality": r.quality or {},
-                }
-                for r in unreadable
-            ],
-            "sampled_out": [
-                {
-                    "file_name": r["file_name"],
-                    "reason": "Excluded by representative sampling.",
-                }
-                for r in sampled_out
-            ],
-            "model_dropped": model_dropped,
-        }
-        total_skipped = len(unreadable) + len(sampled_out) + len(model_dropped)
-        if total_skipped:
-            print(
-                f"[FULL EVAL] {total_skipped} resume(s) skipped: "
-                f"{len(unreadable)} unreadable, {len(sampled_out)} sampled out, "
-                f"{len(model_dropped)} dropped by model."
-            )
-
-    row.full_results = parsed
-    row.status = "completed"
-
+    _run_field_selection(row, db)
+    row.status = "rubric_ready"
     db.commit()
     db.refresh(row)
     return row

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
 import re
 from collections import defaultdict
@@ -10,6 +11,12 @@ from datetime import datetime
 from typing import Any
 
 import pdfplumber
+
+# pdfplumber emits noisy FontBBox / font-descriptor warnings for PDFs that use
+# non-standard fonts. These are harmless — text extraction still works. Silence
+# them so the recruiter-facing terminal doesn't fill with irrelevant noise.
+logging.getLogger("pdfplumber").setLevel(logging.ERROR)
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 
 MONTH_MAP = {
@@ -56,8 +63,14 @@ GENERIC_CONTACT_WORDS = {
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
+    pages = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        pages = [page.extract_text() or "" for page in pdf.pages]
+        for page in pdf.pages:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception:
+                # Corrupt / non-standard page — skip it, don't abort the whole PDF.
+                pages.append("")
     return "\n".join(pages).strip()
 
 
@@ -404,9 +417,99 @@ def parse_resume_text(text: str) -> dict[str, Any]:
     return resume_json
 
 
-def parse_resume_pdf(file_name: str, file_bytes: bytes) -> dict[str, Any]:
+def parse_resume_with_gemini(raw_text: str, file_name: str) -> dict[str, Any]:
+    """Gemini-powered structured field extraction from raw resume text.
+
+    Uses CALL_PARSE prompt to extract a richer JSON than the regex parser —
+    including email, phone, location, LinkedIn, leadership descriptions, etc.
+
+    Falls back to parse_resume_text() on any Gemini error so the upload
+    always succeeds regardless of API availability.
+
+    Returns the same schema as parse_resume_text() plus the extra fields.
+    """
+    from ats_poc.prompts import CALL_PARSE_SYSTEM, CALL_PARSE_TEMPLATE
+    from ats_poc.gemini_client import run_structured_call
+
+    try:
+        parsed, _raw, _usage, _prompt = run_structured_call(
+            model_name="gemini-2.5-flash-lite",
+            system_instruction=CALL_PARSE_SYSTEM,
+            template=CALL_PARSE_TEMPLATE,
+            replacements={"RAW_TEXT": raw_text[:12000]},  # cap at ~3K tokens of text
+            temperature=0.0,
+        )
+        if not isinstance(parsed, dict) or not parsed.get("work_experience") and not parsed.get("name"):
+            # Gemini returned empty or malformed — fall back to regex
+            print(f"[PARSE GEMINI] {file_name}: empty/malformed response, falling back to regex")
+            return parse_resume_text(raw_text)
+
+        # Normalise types — Gemini may return numbers as strings or None values
+        resume = dict(parsed)
+        try:
+            resume["total_experience_years"] = float(resume.get("total_experience_years") or 0)
+        except (TypeError, ValueError):
+            resume["total_experience_years"] = 0.0
+
+        gaps = resume.get("career_gaps_months") or []
+        resume["career_gaps_months"] = [int(g) for g in gaps if isinstance(g, (int, float))]
+
+        for field in ("skills", "certifications", "projects", "publications"):
+            val = resume.get(field)
+            resume[field] = [str(v) for v in val] if isinstance(val, list) else []
+
+        work_exp = resume.get("work_experience") or []
+        normalised_work = []
+        for job in work_exp:
+            if not isinstance(job, dict):
+                continue
+            normalised_work.append({
+                "company": str(job.get("company") or "").strip(),
+                "role": str(job.get("role") or "").strip(),
+                "duration_months": int(job.get("duration_months") or 0),
+                "type": str(job.get("type") or "other").strip().lower(),
+                "description": str(job.get("description") or "").strip()[:500],
+            })
+        resume["work_experience"] = normalised_work
+
+        edu = resume.get("education") or []
+        normalised_edu = []
+        for e in edu:
+            if not isinstance(e, dict):
+                continue
+            normalised_edu.append({
+                "degree": str(e.get("degree") or "").strip(),
+                "institution": str(e.get("institution") or "").strip(),
+                "year": str(e.get("year") or "").strip(),
+                "tier": "",
+            })
+        resume["education"] = normalised_edu
+
+        print(f"[PARSE GEMINI] {file_name}: extracted name={resume.get('name')!r}, "
+              f"{len(normalised_work)} jobs, {len(normalised_edu)} edu entries")
+        return resume
+
+    except Exception as exc:
+        print(f"[PARSE GEMINI] {file_name}: Gemini call failed ({exc}), falling back to regex")
+        return parse_resume_text(raw_text)
+
+
+def parse_resume_pdf(file_name: str, file_bytes: bytes, gemini_parse: bool = False) -> dict[str, Any]:
+    """Parse a resume PDF.
+
+    Args:
+        file_name: Original filename (used for logging).
+        file_bytes: Raw PDF bytes.
+        gemini_parse: If True, use Gemini for structured field extraction
+                      instead of the local regex parser. Requires configure_genai()
+                      to have been called before invoking this function.
+                      Falls back to regex on any Gemini error.
+    """
     raw_text = extract_text_from_pdf(file_bytes)
-    resume_json = parse_resume_text(raw_text)
+    if gemini_parse and raw_text.strip():
+        resume_json = parse_resume_with_gemini(raw_text, file_name)
+    else:
+        resume_json = parse_resume_text(raw_text)
     quality = assess_resume_quality(resume_json, raw_text)
     return {
         "file_name": file_name,

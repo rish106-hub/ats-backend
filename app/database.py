@@ -37,4 +37,10 @@ def init_db() -> None:
         conn.execute(text(
             "ALTER TABLE resumes ADD COLUMN IF NOT EXISTS pdf_bytes BYTEA"
         ))
+        conn.execute(text(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS full_eval_progress JSON"
+        ))
+        conn.execute(text(
+            "ALTER TABLE resumes ADD COLUMN IF NOT EXISTS is_exemplar BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
         conn.commit()

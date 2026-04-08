@@ -91,14 +91,11 @@ def compress_resume(resume_json: dict[str, Any], required_fields: list[str]) -> 
     # Always include basic identification
     compressed["name"] = resume_json.get("name", "")
     
-    # Include verifiable facts for threshold checking
+    # Include verifiable facts for threshold checking — full lists, no truncation,
+    # so college-tier and skills-based baseline checks work on the complete data.
     for field in _VERIFIABLE_FACT_FIELDS:
         if field in resume_json:
-            value = resume_json[field]
-            if field == "education" and isinstance(value, list):
-                compressed[field] = value[:3]
-            else:
-                compressed[field] = value
+            compressed[field] = resume_json[field]
     
     # Process required fields with enhanced qualitative preservation
     for field in required_fields:
@@ -157,12 +154,18 @@ def compress_resume(resume_json: dict[str, Any], required_fields: list[str]) -> 
 
 # Fields that carry hard verifiable facts — always included alongside the lens
 # so the scoring model can check thresholds without re-interpreting raw descriptions.
+# education, skills, and certifications are included so college-tier / certification
+# baseline checks can be verified against concrete values, not just the lens narrative.
 _VERIFIABLE_FACT_FIELDS = {
     "total_experience_years",
     "career_gaps_months",
     "education",
     "work_experience",
+    "skills",
+    "certifications",
     "github_url",
+    "linkedin_url",
+    "location",
 }
 
 
@@ -197,7 +200,8 @@ def build_scored_resume_payload(
         if field in resume_json and resume_json[field] not in (None, "", []):
             value = resume_json[field]
             if field == "education" and isinstance(value, list):
-                payload[field] = value[:3]
+                # Send ALL education entries — college tier checks need the full list.
+                payload[field] = value
             elif field == "work_experience" and isinstance(value, list):
                 # Trim heavy prose but keep company/role/duration/type so the
                 # scoring model can audit YoE, tenure, and career arc.
@@ -219,11 +223,7 @@ def build_scored_resume_payload(
         if field in payload or field in _VERIFIABLE_FACT_FIELDS:
             continue
         if field in resume_json and resume_json[field] not in (None, "", []):
-            value = resume_json[field]
-            if isinstance(value, list):
-                payload[field] = value[:5]
-            else:
-                payload[field] = value
+            payload[field] = resume_json[field]
 
     # Derived convenience fields — make YoE impossible to miss.
     work_exp = resume_json.get("work_experience", []) or []
